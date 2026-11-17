@@ -111,7 +111,8 @@ Only what Entmoot needs, in `src/`:
     - **Filtering:** only bodies we asked for, belonging to this group, are kept.
   - GossipSub on the group topic. We subscribe only once we are on the roster, because the node drops SUBSCRIBEs
     from non-members. The browser therefore receives live messages right after an invite join, with no reconnect
-    (compare entmoot#247).
+    (compare entmoot#247). Whenever the node announces its subscription to the group topic again (it re-added our
+    peer id as a gossipsub peer), we send SUBSCRIBE and GRAFT again; see Limits, "Reload with the same key".
   - **Cleanup:** if `join()` fails after dialing, it closes the connection.
 
 Every message it delivers, from history or live, is checked:
@@ -280,8 +281,16 @@ this is to carry admission over the same WebRTC-direct connection as a new libp2
 
 ## Limits
 
-- **One node connection.** The client talks to one node and does not mesh with other peers. If that node goes down,
-  the page has to call `join` again. There is no automatic reconnect.
+- **One node connection, no reconnect.** The client talks to one node and does not mesh with other peers. If that
+  node restarts or the connection drops, the page goes quiet: no live messages in or out until the page calls
+  `join` again (in practice: reloads). There is no automatic reconnect.
+- **Reload with the same key: up to ~35 s without live messages.** One key is one libp2p peer id. If a page goes
+  away without closing its connection (crash, killed tab) and the same key joins again, the node keeps the old
+  connection until it times out, and in the meantime delivers nothing live to the new page (measured 34.6–35.5 s
+  on entmootd v1.5.102). When the old connection dies, the node drops the subscription the new page sent and
+  announces its own again; the client then subscribes again, and live delivery resumes. Messages published to the
+  group during the gap are in history, but not delivered live. A node-side fix (prefer the newest connection of a
+  peer id) is pending. Before the re-subscribe, the new page got no live messages for the rest of its session.
 - **History only goes one way.** The node's own `/entmoot/history/2`, `/entmoot/peer-records/1` and membership pulls
   to the browser are refused with multistream `na`. This is safe: the node skips the peer. Nothing else can catch up
   from the browser.
