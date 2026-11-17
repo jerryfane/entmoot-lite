@@ -199,25 +199,126 @@ test('review P3: close leaves no pending timers for backoff or ping', async () =
   }
 })
 
-test('reconnect: another session with the same key keeps taking the connection, so stop with code replaced', async () => {
+test('review-2 P2: the fighting pattern backs off long and keeps retrying (contended, never stopped for good)', async () => {
   const { me, node } = member()
-  instantBackoff()
-  // the node closes every connection of this key right after it is set up (another tab keeps taking it)
+  const waits = []
+  clock.timer = (ms, fn, kind) => {
+    if (kind !== 'backoff') return real.timer(ms, fn, kind)
+    waits.push(ms)
+    queueMicrotask(fn)
+    return () => {}
+  }
+  // every connection of this key is closed right after it is set up (another tab keeps taking it) ...
+  let fight = true
   let dials = 0
   const Real = globalThis.RTCPeerConnection
-  globalThis.RTCPeerConnection = class extends Real { constructor (...a) { super(...a); dials++; setTimeout(() => node.pc === this && node.drop(), 30) } }
+  globalThis.RTCPeerConnection = class extends Real { constructor (...a) { super(...a); dials++; setTimeout(() => fight && node.pc === this && node.drop(), 30) } }
+  const errors = []
+  let reconnects = 0
+  let g
+  try {
+    g = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: (e) => errors.push(e), onreconnect: () => reconnects++ })
+    await until(() => waits.filter((ms) => ms === 300000).length >= 2, 10000).catch(() => {})
+    assert.equal(errors.filter((e) => e.code === 'contended').length, 1, 'contended reported once')
+    assert.equal(g.contended, true)
+    assert.deepEqual(waits.slice(0, 5), [1000, 1000, 60000, 300000, 300000], 'long backoff after the fight')
+    // ... until the other session goes away: the next attempt sticks
+    fight = false
+    await until(() => g.connected && reconnects > 0, 5000)
+    assert.ok(dials > 3, 'still retrying')
+    assert.ok(!errors.some((e) => e.code === 'replaced'), 'no permanent stop')
+  } finally { globalThis.RTCPeerConnection = Real; g?.close() }
+})
+
+test('review-2 P2: close reaches a dial in progress and closes its RTCPeerConnection', async () => {
+  const { me, node } = member()
+  instantBackoff()
+  const g = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: () => {} })
+  // from now on dials hang in the handshake (the answer never applies)
+  const Real = globalThis.RTCPeerConnection
+  const pcs = []
+  globalThis.RTCPeerConnection = class extends Real { constructor (...a) { super(...a); pcs.push(this) } setRemoteDescription () { return new Promise(() => {}) } }
+  try {
+    node.drop()
+    await until(() => pcs.length === 1, 5000)
+    await tick()
+    g.close()
+    await tick()
+    assert.equal(pcs[0].connectionState, 'closed', 'the dial in progress was closed by close()')
+  } finally { globalThis.RTCPeerConnection = Real }
+})
+
+test('review-2 P2: an expired attempt closes its dial before the next attempt dials (no overlap)', async () => {
+  const { me, node } = member()
+  instantBackoff()
+  clock.attemptMs = 200
+  // the caller's 60 s dial timeout is clamped under the 200 ms attempt deadline
+  const g = await join({ addr: node.addr, groupId: GROUP, key: me.seed, timeout: 60000, onerror: () => {} })
+  const Real = globalThis.RTCPeerConnection
+  const log = []; let made = 0
+  globalThis.RTCPeerConnection = class extends Real {
+    constructor (...a) { super(...a); this.n = made++; log.push('open ' + this.n) }
+    setRemoteDescription () { return new Promise(() => {}) }
+    close () { if (this.connectionState !== 'closed') log.push('close ' + this.n); super.close() }
+  }
+  const t0 = Date.now()
+  try {
+    node.drop()
+    await until(() => log.includes('open 1'), 5000)
+    assert.deepEqual(log.slice(0, 3), ['open 0', 'close 0', 'open 1'])
+    assert.ok(Date.now() - t0 < 2000, 'the dial was cut at the attempt deadline, not the 60 s dial timeout')
+  } finally { globalThis.RTCPeerConnection = Real; g.close() }
+})
+
+/** an in-memory BroadcastChannel (same-origin pages of one browser): messages reach other instances by name */
+function fakeBroadcast () {
+  const all = new Set()
+  return class {
+    constructor (name) { this.name = name; all.add(this) }
+    postMessage (data) { for (const c of all) if (c !== this && c.name === this.name) queueMicrotask(() => c.onmessage?.({ data: structuredClone(data) })) }
+    close () { all.delete(this) }
+  }
+}
+
+test('replaced: another page of this browser connecting with the same key stops this one for good', async () => {
+  const { me, node } = member()
+  instantBackoff()
+  const BC = globalThis.BroadcastChannel
+  globalThis.BroadcastChannel = fakeBroadcast()
+  const names = []
+  const Spy = globalThis.BroadcastChannel
+  globalThis.BroadcastChannel = class extends Spy { constructor (n) { super(n); names.push(n) } }
   const errors = []
   try {
-    const g = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: (e) => errors.push(e) })
-    await until(() => errors.some((e) => e.code === 'replaced'), 5000).catch(() => {})
-    const at = dials
-    await tick(300)
-    assert.ok(errors.some((e) => e.code === 'replaced'), 'stopped with code replaced')
-    assert.equal(at, 3, 'three short-lived connections')
-    assert.equal(dials, at, 'no more dials after replaced')
-    assert.equal(g.connected, false)
-    assert.equal(g.stopped?.code, 'replaced')
-    await assert.rejects(g.publish('t/a', 'hi'), (e) => e.code === 'replaced')
+    const a = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: (e) => errors.push(e) })
+    const firstPc = node.pc
+    // the second tab: same key, same browser
+    const b = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: () => {} })
+    await until(() => errors.some((e) => e.code === 'replaced'))
+    assert.equal(a.stopped?.code, 'replaced')
+    assert.equal(a.connected, false)
+    assert.equal(firstPc.connectionState, 'closed')
+    await assert.rejects(a.publish('t/a', 'hi'), (e) => e.code === 'replaced')
+    await tick(100)
+    assert.equal(b.connected, true, 'the new tab keeps the key')
+    assert.equal(b.stopped, null)
+    // named from the public key, never the seed
+    assert.equal(names[0], names[1])
+    assert.ok(!names[0].includes(Buffer.from(me.seed).toString('hex').slice(0, 16)))
+    b.close()
+  } finally { globalThis.BroadcastChannel = BC }
+})
+
+test('replaced: without BroadcastChannel (opaque sandbox) the client just keeps reconnecting', async () => {
+  const { me, node } = member()
+  instantBackoff()
+  const BC = globalThis.BroadcastChannel
+  globalThis.BroadcastChannel = class { constructor () { throw Error('SecurityError') } }
+  try {
+    const g = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: () => {} })
+    node.drop()
+    await until(() => g.connected, 5000)
+    assert.equal(g.stopped, null)
     g.close()
-  } finally { globalThis.RTCPeerConnection = Real }
+  } finally { globalThis.BroadcastChannel = BC }
 })

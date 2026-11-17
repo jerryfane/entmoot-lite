@@ -43,8 +43,9 @@ g.close()
   - **Drop detection:** a failed or closed WebRTC connection, or a libp2p ping (`/ipfs/ping/1.0.0`, every 15 s)
     that gets no answer within 10 s. The ping is what notices a restarted node: the new process answers ICE on the
     same port, so the old connection still looks connected.
-  - **Attempt deadline:** each attempt (dial, membership, subscription) gets 30 s. An attempt that runs out is
-    closed and the next one is scheduled, so a node that accepts the connection but never answers can't stall it.
+  - **Attempt deadline:** each attempt (dial, membership, subscription) gets 30 s, and the dial's own timeout is
+    clamped under it. An attempt that runs out is aborted: its RTCPeerConnection is closed, during the dial too,
+    before the next attempt dials. So a node that accepts the connection but never answers can't stall it.
   - **Back online:** it subscribes again, then delivers once, oldest first, every stored message from up to 30 s
     before the drop that it never delivered (`msg.late === true`), however many there are. Then it calls
     `onreconnect()`.
@@ -52,11 +53,20 @@ g.close()
     A `publish()` whose connection drops while it signs also rejects with `offline`; it never resolves unsent.
   - **Another session with the same key** (a second tab or agent): the node keeps one connection per key and closes
     the older one, so two such pages would knock each other off forever. After 3 drops within 60 s of connections
-    that lived less than 30 s, the client stops for good. It reports an error with `code: 'replaced'` to `onerror`
-    and sets `g.stopped`; `publish()` then rejects with that error.
-  - **Gives up** also if the node no longer counts the key as a member (reported to `onerror`).
-  - **`g.close()`** stops everything: no reconnect, an attempt in progress is cancelled and its connection closed,
-    and no timers are left behind.
+    that lived less than 30 s, the client reports `code: 'contended'` to `onerror` (once) and sets `g.contended`.
+    It keeps reconnecting, but only after 60 s and then every 5 min, until a connection lasts 30 s. The same pattern
+    can come from a flaky network, so the client never stops for good on it.
+  - **Same key in another tab of this browser:** each connection announces itself on a `BroadcastChannel` named
+    from a hash of the public key (never the seed). A page that hears another session of its key stops for good:
+    `onerror` gets `code: 'replaced'`, `g.stopped` is set, and `publish()` rejects with it. This only works where
+    the pages share an origin: an inscription opened top-level (e.g. on ordinals.com) shares it with the site's
+    other tabs. Inside ord's `<iframe sandbox="allow-scripts">` the origin is opaque, the pages can't hear each
+    other, and only the 'contended' hint applies. Where `BroadcastChannel` is missing or blocked, it is skipped.
+    The node gives no "replaced" signal (a second device with the key looks like any other drop).
+  - **Gives up** only on `g.close()`, on 'replaced' (above), or if the node no longer counts the key as a member
+    (reported to `onerror`).
+  - **`g.close()`** stops everything: no reconnect, an attempt in progress is aborted and its connection closed
+    (even mid-dial), and no timers are left behind.
   - Each failed attempt is reported to `onerror`.
 - `onerror(e)` receives errors that happen while live traffic is processed: a throwing `on()` handler, an RPC that
   fails to decode, or a failure inside the client. Delivery continues afterwards. A message that fails its signature
@@ -246,7 +256,10 @@ ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> 
     `offline`; `close()` during the backoff; a removed member giving up; a node that stops answering pings.
   - **Review fixes:** `close()` during an attempt that is still waiting for membership; an attempt that never gets
     a membership answer is abandoned and retried; `publish()` racing a drop rejects; a catch-up of 520 messages
-    delivers all of them; no timers left after `close()`; three short-lived connections stop with `replaced`.
+    delivers all of them; no timers left after `close()`; the fighting pattern backs off (60 s, 5 min) and keeps
+    retrying; `close()` closes a dial in progress; an expired attempt closes its dial before the next one dials;
+    a second page with the key on a (fake) `BroadcastChannel` stops the first for good; without `BroadcastChannel`
+    the client keeps reconnecting.
 - **The built module** (`test/dist.test.js`): `dist/entmoot-lite.js` inlined as a classic script.
   - **Scope:** it adds no globals besides its API.
   - **Name clashes:** verification still passes after the page overwrites every one- and two-letter global name.
