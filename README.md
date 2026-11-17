@@ -43,10 +43,20 @@ g.close()
   - **Drop detection:** a failed or closed WebRTC connection, or a libp2p ping (`/ipfs/ping/1.0.0`, every 15 s)
     that gets no answer within 10 s. The ping is what notices a restarted node: the new process answers ICE on the
     same port, so the old connection still looks connected.
-  - **Back online:** it subscribes again, then delivers once, oldest first, the stored messages from up to 30 s
-    before the drop that it never delivered (`msg.late === true`). Then it calls `onreconnect()`.
+  - **Attempt deadline:** each attempt (dial, membership, subscription) gets 30 s. An attempt that runs out is
+    closed and the next one is scheduled, so a node that accepts the connection but never answers can't stall it.
+  - **Back online:** it subscribes again, then delivers once, oldest first, every stored message from up to 30 s
+    before the drop that it never delivered (`msg.late === true`), however many there are. Then it calls
+    `onreconnect()`.
   - **While it is down:** `g.connected` is false, and `publish()` and `history()` reject with `e.code === 'offline'`.
-  - **Gives up** only if the node no longer counts the key as a member (reported to `onerror`). `g.close()` stops it.
+    A `publish()` whose connection drops while it signs also rejects with `offline`; it never resolves unsent.
+  - **Another session with the same key** (a second tab or agent): the node keeps one connection per key and closes
+    the older one, so two such pages would knock each other off forever. After 3 drops within 60 s of connections
+    that lived less than 30 s, the client stops for good. It reports an error with `code: 'replaced'` to `onerror`
+    and sets `g.stopped`; `publish()` then rejects with that error.
+  - **Gives up** also if the node no longer counts the key as a member (reported to `onerror`).
+  - **`g.close()`** stops everything: no reconnect, an attempt in progress is cancelled and its connection closed,
+    and no timers are left behind.
   - Each failed attempt is reported to `onerror`.
 - `onerror(e)` receives errors that happen while live traffic is processed: a throwing `on()` handler, an RPC that
   fails to decode, or a failure inside the client. Delivery continues afterwards. A message that fails its signature
@@ -234,6 +244,9 @@ ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> 
     delivers the stored message it missed once (late), then live messages again.
   - **Timing and control:** the backoff (1, 2, 5, 10, then 30 s); offline `publish`/`history` rejecting with
     `offline`; `close()` during the backoff; a removed member giving up; a node that stops answering pings.
+  - **Review fixes:** `close()` during an attempt that is still waiting for membership; an attempt that never gets
+    a membership answer is abandoned and retried; `publish()` racing a drop rejects; a catch-up of 520 messages
+    delivers all of them; no timers left after `close()`; three short-lived connections stop with `replaced`.
 - **The built module** (`test/dist.test.js`): `dist/entmoot-lite.js` inlined as a classic script.
   - **Scope:** it adds no globals besides its API.
   - **Name clashes:** verification still passes after the page overwrites every one- and two-letter global name.
