@@ -16,16 +16,23 @@ const HISTORY = '/entmoot/history/2'
 const RETRY_MS = [1000, 2000, 5000, 10000, 30000]
 /** after a reconnect, stored messages this long before the drop are checked for ones we missed */
 const CATCH_UP_MS = 30000
-const CATCH_UP_MAX = 512
 /**
  * Liveness: ICE alone doesn't notice a restarted node (the new process answers ICE checks on the same
  * port, but the DTLS/SCTP session is gone and nothing arrives). So every clock.pingMs (15 s) we open a
  * stream and libp2p-ping the node; no answer within clock.pingWaitMs (10 s) means the connection is dead.
  */
 const PING = '/ipfs/ping/1.0.0'
-/** a timer that doesn't keep a Node.js process (tests) alive; browsers have no unref */
-const nap = (ms) => new Promise((resolve) => setTimeout(resolve, ms).unref?.())
 const offline = () => Object.assign(Error('not connected to the node (reconnecting)'), { code: 'offline' })
+const closedError = () => Object.assign(Error('closed'), { code: 'closed' })
+/**
+ * One key is one connection on the node: a second page (tab, agent) with the same key closes the first
+ * one's connection. Two such pages that both reconnect would close each other forever. A connection that
+ * drops within SHORT_MS of being made counts as short; REPLACED_AFTER short drops within REPLACED_WINDOW_MS
+ * means another session holds this key, and the client stops (code 'replaced').
+ */
+const SHORT_MS = 30000
+const REPLACED_WINDOW_MS = 60000
+const REPLACED_AFTER = 3
 
 /**
  * @param {object} o
@@ -47,6 +54,22 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
   const delivered = new Set() // Entmoot ids delivered to on() or published by us: each message once
   let seq = BigInt(Date.now()) * 1000000n
   let conn; let r; let closing = false; let joinedAt = 0
+  let candidate = null // a connection being set up by a reconnect attempt, not yet committed
+  let stopped = null // the error that ended the session for good ('replaced'), if any
+  const shortDrops = []
+  // Every wait (backoff, ping interval, ping and attempt deadlines) is cancelled by close().
+  const waits = new Set()
+  /** resolves after ms, or at once when close() runs; .cancel() ends it early */
+  const wait = (ms, kind) => {
+    let stop
+    const p = new Promise((resolve) => {
+      const cancel = clock.timer(ms, () => { waits.delete(stop); resolve() }, kind)
+      stop = () => { cancel(); waits.delete(stop); resolve() }
+      waits.add(stop)
+    })
+    p.cancel = stop
+    return p
+  }
 
   const deliver = (m) => {
     if (delivered.has(m.id)) return
@@ -112,9 +135,15 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
   // bans): it serves membership to a member's key without a capability, and to no one else.
   const asMember = (c) => roster(c).catch((e) => { if (/unauthorized|not_member/.test(e.res?.error)) return null; throw e })
 
-  /** dial, become (or confirm we are) a member, subscribe; the invite is used only by the first connection */
-  const connect = async (first) => {
+  /**
+   * dial, become (or confirm we are) a member, subscribe; the invite is used only by the first connection.
+   * `attempt` (reconnects): {abandoned} is set when the attempt ran out of time; the connection is only
+   * committed if neither that nor close() happened meanwhile.
+   */
+  const connect = async (first, attempt = {}) => {
     const c = await dial(addr, seed, pub, handlers, timeout)
+    if (closing || attempt.abandoned) { c.close(); throw closing ? closedError() : Error('reconnect attempt timed out') }
+    candidate = attempt.c = c
     try {
       let m = await asMember(c)
       if (!m) {
@@ -133,8 +162,11 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
         if (!m) throw Error('join record not applied by the node')
       }
       // GossipSub: subscribe only now that we are on the roster (the node drops non-member SUBSCRIBEs)
-      out = await c.stream(MESHSUB)
-      conn = c; r = m
+      const o = await c.stream(MESHSUB)
+      if (closing) throw closedError()
+      if (attempt.abandoned) throw Error('reconnect attempt timed out')
+      conn = c; out = o; r = m
+      c.at = Date.now()
       subscribe()
       c.closed.then(() => dropped(c))
       keepalive(c)
@@ -142,13 +174,15 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
     } catch (e) {
       c.close()
       throw e
+    } finally {
+      if (candidate === c) candidate = null
     }
   }
 
   // ---- losing the node and finding it again ------------------------------------------------------
   const keepalive = async (c) => {
     while (c === conn && !closing) {
-      await nap(clock.pingMs)
+      await wait(clock.pingMs, 'ping')
       if (c !== conn || closing) return
       const ping = random(32)
       const pong = (async () => {
@@ -160,7 +194,10 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
           return /protocol refused/.test(e.message) // a node without ping still answered
         } finally { st?.close() }
       })()
-      const alive = await Promise.race([pong, nap(clock.pingWaitMs).then(() => false)])
+      const deadline = wait(clock.pingWaitMs, 'deadline')
+      const alive = await Promise.race([pong, deadline.then(() => false)])
+      deadline.cancel()
+      if (closing) return
       if (!alive && c === conn) { onerror(Error('the node stopped answering; reconnecting')); dropped(c) }
     }
   }
@@ -169,28 +206,47 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
     const at = Date.now()
     conn = null; out = null
     c.close()
+    if (at - c.at < SHORT_MS) shortDrops.push(at)
+    while (shortDrops.length && shortDrops[0] < at - REPLACED_WINDOW_MS) shortDrops.shift()
+    if (shortDrops.length >= REPLACED_AFTER) {
+      stopped = Object.assign(Error('another session with this key took over the connection (another tab or agent?)'), { code: 'replaced' })
+      for (const stop of [...waits]) stop()
+      return onerror(stopped)
+    }
     for (let i = 0; ; i++) {
-      await clock.sleep(RETRY_MS[Math.min(i, RETRY_MS.length - 1)])
+      await wait(RETRY_MS[Math.min(i, RETRY_MS.length - 1)], 'backoff')
       if (closing) return
-      try {
-        await connect(false)
-        break
-      } catch (e) {
-        if (e.fatal) return onerror(e)
-        onerror(Object.assign(Error('reconnect attempt ' + (i + 1) + ' failed: ' + e.message), { cause: e }))
+      // one deadline for the whole attempt: a node that accepts the connection but never answers the
+      // membership request (or the subscription) must not stop the reconnecting
+      const attempt = {}
+      const deadline = wait(clock.attemptMs, 'deadline')
+      const done = connect(false, attempt)
+      const result = await Promise.race([done.then(() => 'ok', (e) => e), deadline.then(() => 'timeout')])
+      deadline.cancel()
+      if (result === 'timeout') {
+        attempt.abandoned = true
+        attempt.c?.close()
+        done.catch(() => {})
       }
+      if (closing) return
+      if (result === 'ok') break
+      const e = result === 'timeout' ? Error('timed out after ' + clock.attemptMs + ' ms') : result
+      if (e.fatal) return onerror(e)
+      onerror(Object.assign(Error('reconnect attempt ' + (i + 1) + ' failed: ' + e.message), { cause: e }))
     }
     // stored messages from around the drop on that we never got live
     try { await catchUp(Math.max(joinedAt, at - CATCH_UP_MS)) } catch (e) { onerror(e) }
     if (!closing && onreconnect) try { onreconnect() } catch (e) { onerror(e) }
   }
+  /** deliver (late) every stored message since `since` that was never delivered, oldest first */
   const catchUp = async (since) => {
     const ids = await listIds()
     const got = []
     const wanted = (m) => m.timestamp >= since && !delivered.has(m.id) && subs.some(([p]) => m.topics?.some((t) => match(p, t)))
+    // batches come newest first; stop at the first batch that reaches back past `since`
     for await (const { kept, oldest } of bodies(ids, wanted)) {
       got.push(...kept)
-      if (oldest < since || got.length >= CATCH_UP_MAX) break
+      if (oldest < since) break
     }
     for (const m of got.sort((a, b) => a.timestamp - b.timestamp)) deliver({ ...m, late: true })
   }
@@ -251,8 +307,10 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
     me,
     /** the current connection to the node (null while reconnecting) */
     get conn () { return conn },
-    /** false while the connection to the node is down and being made again */
+    /** false while the connection to the node is down and being made again, or for good once replaced */
     get connected () { return !!conn },
+    /** set (code 'replaced') once another session with this key took over: no more reconnecting */
+    get stopped () { return stopped },
     topic,
     /** roster checkpoint id cited by new messages */
     get rosterHead () { return r.canonical },
@@ -263,7 +321,9 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
     /** sign and gossip a message; resolves with its id. Rejects with code 'offline' while reconnecting. */
     async publish (t, content) {
       if (!validTopic(t)) throw Error('invalid topic: ' + JSON.stringify(t))
+      if (stopped) throw stopped
       if (!conn) throw offline()
+      const via = out // the connection's gossip stream this message goes out on
       const m = await sign('message/v2', {
         version: 2, group_id: groupId, author: me, timestamp: Date.now(), topics: [t],
         content: b64(typeof content === 'string' ? enc(content) : content) || undefined, roster_head: r.canonical
@@ -272,9 +332,11 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
       const sn = new Uint8Array(8); new DataView(sn.buffer).setBigUint64(0, ++seq)
       const fields = [[1, peerIdBytes(pub)], [2, data], [3, sn], [4, topic]]
       seen.add(hex(await sha256(cat(enc('entmoot/pubsub-envelope/v2\0'), data))))
+      const sig = await edSign(seed, cat(PUBSUB_SIG, pb(fields)))
+      // the connection may have dropped (or been replaced) while we signed: then nothing would be sent
+      if (out !== via || !via) throw offline()
       delivered.add(m.id)
-      if (!out) throw offline()
-      send([[2, pb([...fields, [5, await edSign(seed, cat(PUBSUB_SIG, pb(fields)))]])]])
+      via.write(lp(pb([[2, pb([...fields, [5, sig]])]])))
       return m.id
     },
     /** newest n verified stored messages of this group matching pattern, oldest first */
@@ -286,8 +348,13 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
       }
       return [...got.values()].sort((a, b) => a.timestamp - b.timestamp).slice(-n)
     },
-    /** close the connection for good (no reconnect) */
-    close () { closing = true; conn?.close() }
+    /** close the connection for good: no reconnect, a reconnect in progress is cancelled, no timers left */
+    close () {
+      closing = true
+      for (const stop of [...waits]) stop()
+      conn?.close()
+      candidate?.close()
+    }
   }
   return g
 }
