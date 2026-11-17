@@ -18,8 +18,10 @@ const HISTORY = '/entmoot/history/2'
  * @param {string} o.groupId  base64 group id
  * @param {Uint8Array|string} o.key  32-byte Ed25519 seed (or base64 of it); never stored
  * @param {object} [o.invite] target-bound invite (BootstrapCapability JSON) for this key
+ * @param {(e: Error) => void} [o.onerror] errors while processing live traffic (a throwing
+ *   on() handler, a failure inside the client); the connection keeps running. Default console.error.
  */
-export async function join ({ addr, groupId, key, invite, timeout }) {
+export async function join ({ addr, groupId, key, invite, timeout, onerror = (e) => console.error('entmoot-lite:', e) }) {
   const seed = typeof key === 'string' ? unb64(key) : key
   const pub = await edPublic(seed)
   const me = { entmoot_pubkey: b64(pub), member_id: await memberId(pub), peer_id: b58(peerIdBytes(pub)) }
@@ -33,8 +35,8 @@ export async function join ({ addr, groupId, key, invite, timeout }) {
     seen.add(mid)
     let m
     try { m = JSON.parse(dec(data)) } catch { return }
-    if (m.group_id !== groupId || !await verify(m)) return
-    for (const [p, fn] of subs) if (m.topics?.some((t) => match(p, t))) fn(decode(m))
+    if (m?.group_id !== groupId || !await verify(m)) return
+    for (const [p, fn] of subs) if (m.topics?.some((t) => match(p, t))) try { fn(decode(m)) } catch (e) { onerror(e) }
   }
   const onRpc = async (b) => {
     const r = unpb(b)
@@ -49,7 +51,8 @@ export async function join ({ addr, groupId, key, invite, timeout }) {
   const conn = await dial(addr, seed, pub, {
     // identify: tell the node we speak gossipsub, or it never adds us as a pubsub peer
     '/ipfs/id/1.0.0': (st) => { st.write(lp(pb([[1, pb([[1, 1], [2, pub]])], [3, ['/ipfs/id/1.0.0', MESHSUB]], [5, 'ipfs/0.1.0'], [6, 'entmoot-lite/0.1']]))); st.end() },
-    [MESHSUB]: async (st) => { for (;;) await onRpc(await st.lp()) }
+    // one bad RPC (or a bug) must not end live delivery silently: report it and keep reading
+    [MESHSUB]: async (st) => { for (;;) { const b = await st.lp(); try { await onRpc(b) } catch (e) { onerror(e) } } }
   }, timeout)
 
   // Entmoot sync protocols: one JSON line, half-close, one JSON reply. Errors carry the reply.

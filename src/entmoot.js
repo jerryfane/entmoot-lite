@@ -39,16 +39,17 @@ export async function sign (domain, obj, seed) {
  * Check id, Ed25519 signature and member id of a received message, version 2 or legacy 0
  * (unprefixed, authored before member ids). This proves who wrote it, not that the author was
  * a member: roster checks are the serving node's (see README, trust boundary).
+ * Malformed messages give false; an internal failure throws rather than reading as "unverified".
  */
 export async function verify (m) {
-  try {
-    const v = m.version || 0
-    if (v !== 0 && v !== 2) return false
-    const pub = unb64(m.author.entmoot_pubkey)
-    const bytes = signingBytes(v ? 'message/v2' : '', m)
-    return m.id === b64(await sha256(bytes)) && ((!v && !m.author.member_id) || m.author.member_id === await memberId(pub)) &&
-      await edVerify(pub, bytes, unb64(m.signature))
-  } catch { return false }
+  const v = m?.version || 0
+  const a = m?.author
+  if (!m || (v !== 0 && v !== 2) || typeof m.id !== 'string' || typeof m.signature !== 'string' || typeof a?.entmoot_pubkey !== 'string') return false
+  let pub, sig
+  try { pub = unb64(a.entmoot_pubkey); sig = unb64(m.signature) } catch { return false } // not base64
+  const bytes = signingBytes(v ? 'message/v2' : '', m)
+  return m.id === b64(await sha256(bytes)) && ((!v && !a.member_id) || a.member_id === await memberId(pub)) &&
+    edVerify(pub, bytes, sig)
 }
 
 /** Go topic.ValidTopic: printable ASCII, no empty segments, no wildcards. */
