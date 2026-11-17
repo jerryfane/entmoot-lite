@@ -57,7 +57,9 @@ g.close()
     It keeps reconnecting, but only after 60 s and then every 5 min, until a connection lasts 30 s. The same pattern
     can come from a flaky network, so the client never stops for good on it.
   - **Same key in another tab of this browser:** each connection announces itself on a `BroadcastChannel` named
-    from a hash of the public key (never the seed). A page that hears another session of its key stops for good:
+    from a hash of the public key (never the seed), with when its session started. A page that has been connected
+    hears a NEWER session of its key (started later) and stops for good, also while it is in backoff or mid-attempt
+    (the work is cancelled); announcements of older sessions are ignored, so the newer tab always keeps the key:
     `onerror` gets `code: 'replaced'`, `g.stopped` is set, and `publish()` rejects with it. This only works where
     the pages share an origin: an inscription opened top-level (e.g. on ordinals.com) shares it with the site's
     other tabs. Inside ord's `<iframe sandbox="allow-scripts">` the origin is opaque, the pages can't hear each
@@ -258,8 +260,9 @@ ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> 
     a membership answer is abandoned and retried; `publish()` racing a drop rejects; a catch-up of 520 messages
     delivers all of them; no timers left after `close()`; the fighting pattern backs off (60 s, 5 min) and keeps
     retrying; `close()` closes a dial in progress; an expired attempt closes its dial before the next one dials;
-    a second page with the key on a (fake) `BroadcastChannel` stops the first for good; without `BroadcastChannel`
-    the client keeps reconnecting.
+    a second page with the key on a (fake) `BroadcastChannel` stops the first for good, also while the first is in
+    backoff, and an older session's announcement never stops the newer one; without `BroadcastChannel` the client
+    keeps reconnecting; `close()` from the 'contended' callback leaves no new backoff.
 - **The built module** (`test/dist.test.js`): `dist/entmoot-lite.js` inlined as a classic script.
   - **Scope:** it adds no globals besides its API.
   - **Name clashes:** verification still passes after the page overwrites every one- and two-letter global name.

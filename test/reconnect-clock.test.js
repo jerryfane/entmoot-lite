@@ -322,3 +322,62 @@ test('replaced: without BroadcastChannel (opaque sandbox) the client just keeps 
     g.close()
   } finally { globalThis.BroadcastChannel = BC }
 })
+
+test('review-3 P2: a newer tab taking over while the old one is in backoff stops the old one', async () => {
+  const { me, node } = member()
+  // backoff never ends on its own: the old tab stays between attempts
+  clock.timer = (ms, fn, kind) => kind === 'backoff' ? () => {} : real.timer(ms, fn, kind)
+  const BC = globalThis.BroadcastChannel
+  globalThis.BroadcastChannel = fakeBroadcast()
+  const errors = []
+  try {
+    const a = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: (e) => errors.push(e) })
+    node.drop() // the old transport closed before the new tab connected
+    await until(() => !a.connected)
+    await tick(5)
+    const b = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: () => {} })
+    await until(() => errors.some((e) => e.code === 'replaced'), 2000).catch(() => {})
+    assert.equal(a.stopped?.code, 'replaced', 'the old tab, in backoff, honoured the takeover')
+    assert.equal(b.stopped, null)
+    b.close()
+  } finally { globalThis.BroadcastChannel = BC }
+})
+
+test('review-3 P2: an announcement from an older session never stops the newer tab', async () => {
+  const { me, node } = member()
+  instantBackoff()
+  const BC = globalThis.BroadcastChannel
+  const Fake = fakeBroadcast()
+  const names = []
+  globalThis.BroadcastChannel = class extends Fake { constructor (n) { super(n); names.push(n) } }
+  try {
+    const b = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: () => {} })
+    // an older tab of the same key comes back from its backoff and announces its (re)connection
+    const older = new Fake(names[0])
+    older.postMessage({ session: 'f'.repeat(32), started: Date.now() - 60000, at: Date.now() })
+    await tick(50)
+    assert.equal(b.stopped, null, 'the newer tab keeps the key')
+    older.close()
+    b.close()
+  } finally { globalThis.BroadcastChannel = BC }
+})
+
+test('review-3 P3: close from the onerror handler on contended creates no new backoff', async () => {
+  const { me, node } = member()
+  const backoffs = []
+  clock.timer = (ms, fn, kind) => {
+    if (kind !== 'backoff') return real.timer(ms, fn, kind)
+    backoffs.push(ms)
+    queueMicrotask(fn)
+    return () => {}
+  }
+  const Real = globalThis.RTCPeerConnection
+  globalThis.RTCPeerConnection = class extends Real { constructor (...a) { super(...a); setTimeout(() => node.pc === this && node.drop(), 30) } }
+  let g
+  try {
+    g = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: (e) => { if (e.code === 'contended') g.close() } })
+    await until(() => backoffs.length >= 2, 5000)
+    await tick(300)
+    assert.deepEqual(backoffs, [1000, 1000], 'no 60 s backoff after close() in the callback')
+  } finally { globalThis.RTCPeerConnection = Real; g?.close() }
+})
