@@ -4,12 +4,13 @@
 import { edPublic, edSign, random, sha256 } from './crypto.js'
 import { dial, peerIdBytes } from './webrtc.js'
 import { pb, unpb } from './pb.js'
-import { sign, verify, memberId, pubsubTopic, match } from './entmoot.js'
+import { sign, verify, memberId, pubsubTopic, match, validTopic } from './entmoot.js'
 import { b58, b64, cat, dec, enc, hex, lp, unb64 } from './util.js'
 
 export { verify, match }
 const MESHSUB = '/meshsub/1.1.0'
 const PUBSUB_SIG = enc('libp2p-pubsub:')
+const HISTORY = '/entmoot/history/2'
 
 /**
  * @param {object} o
@@ -51,82 +52,129 @@ export async function join ({ addr, groupId, key, invite, timeout }) {
     [MESHSUB]: async (st) => { for (;;) await onRpc(await st.lp()) }
   }, timeout)
 
-  // Entmoot sync protocols: one JSON line, half-close, one JSON reply.
+  // Entmoot sync protocols: one JSON line, half-close, one JSON reply. Errors carry the reply.
   const rpc = async (proto, req) => {
     const st = await conn.stream(proto, enc(JSON.stringify({ request_id: b64(random(9)), group_id: groupId, ...req }) + '\n'))
     st.end()
     const r = JSON.parse(dec(await st.all()))
-    if (r.error) throw Error(`${proto}: ${r.error}${r.reason ? ' (' + r.reason + ')' : ''}`)
+    if (r.error) throw Object.assign(Error(`${proto}: ${r.error}${r.reason ? ' (' + r.reason + ')' : ''}`), { res: r })
     return r
   }
-  // The invite authorizes sync requests until we are on the roster; afterwards membership does.
-  let cap = invite
-  const roster = () => rpc('/entmoot/membership/1', { version: 1, capability: cap, limit: 512 })
-
-  let r = await roster()
-  const isMember = () => {
-    const cp = r.checkpoints?.at(-1)
-    let ok = !!cp?.members.some((x) => x.member_id === me.member_id)
-    for (const rec of r.records || []) if (rec.subject?.member_id === me.member_id) ok = rec.kind === 'join' || (ok && !/leave|remove/.test(rec.kind))
-    return ok
+  /** the whole /entmoot/membership/1 answer: checkpoint and record pages walked to completion */
+  const roster = async (capability) => {
+    const cps = new Map(); const recs = new Map(); let r = {}
+    do {
+      const last = [...cps.values()].at(-1); const before = cps.size + recs.size
+      r = await rpc('/entmoot/membership/1', {
+        version: 1, capability, limit: 512, have_sequence: last?.sequence || undefined, have_checkpoint: last?.id, after_timestamp: r.next_timestamp, after_id: r.next_id
+      })
+      for (const c of r.checkpoints || []) cps.set(c.id, c)
+      for (const x of r.records || []) recs.set(x.id, x)
+      if (!r.complete && cps.size + recs.size === before) throw Error('membership: paging made no progress')
+    } while (!r.complete)
+    return { ...r, checkpoints: [...cps.values()], records: [...recs.values()] }
   }
-  if (!isMember()) {
-    if (!invite) throw Error('not a member of this group and no invite given')
-    const record = await sign('membership-record/v3', {
-      version: 3, group_id: groupId, kind: 'join', actor: me, subject: me, invite, invite_nonce: Array(32).fill(0), timestamp: Date.now()
-    }, seed)
-    await rpc('/entmoot/membership-push/1', { version: 1, capability: invite, record })
-    r = await roster()
-  }
-  cap = undefined
+  // Whether we are a member is the node's own Go roster projection (joins, rekeys, removals,
+  // bans): it serves membership to a member's key without a capability, and to no one else.
+  const asMember = () => roster().catch((e) => { if (/unauthorized|not_member/.test(e.res?.error)) return null; throw e })
 
-  // GossipSub: subscribe only now that we are on the roster (the node drops non-member SUBSCRIBEs)
-  out = await conn.stream(MESHSUB)
-  send([[1, pb([[1, true], [2, topic]])], [3, pb([[3, pb([[1, topic]])]])]])
-
-  const g = {
-    me,
-    conn,
-    topic,
-    /** roster checkpoint id cited by new messages */
-    get rosterHead () { return r.canonical },
-    /** refresh and return the raw /entmoot/membership/1 reply (checkpoints, records, canonical) */
-    async roster () { return (r = await roster()) },
-    /** call fn(msg) for every verified live message whose topics match pattern ("+", "#" wildcards) */
-    on (pattern, fn) { subs.push([pattern, fn]); return g },
-    /** sign and gossip a message; resolves with its id */
-    async publish (t, content) {
-      const m = await sign('message/v2', {
-        version: 2, group_id: groupId, author: me, timestamp: Date.now(), topics: [t],
-        content: b64(typeof content === 'string' ? enc(content) : content) || undefined, roster_head: r.canonical
+  try {
+    let r = await asMember()
+    if (!r) {
+      if (!invite) throw Error('not a member of this group and no invite given')
+      // As the node's own record writer does (membership/group.go): land after the canonical
+      // checkpoint and every record it holds, or the record is refused as stale.
+      const held = await roster(invite)
+      const cp = held.checkpoints.find((c) => c.id === held.canonical)
+      const floor = Math.max(cp?.timestamp || 0, ...held.records.map((x) => x.timestamp))
+      const record = await sign('membership-record/v3', {
+        version: 3, group_id: groupId, kind: 'join', actor: me, subject: me, invite, invite_nonce: Array(32).fill(0), timestamp: Math.max(Date.now(), floor + 1)
       }, seed)
-      const data = enc(JSON.stringify(m))
-      const sn = new Uint8Array(8); new DataView(sn.buffer).setBigUint64(0, ++seq)
-      const fields = [[1, peerIdBytes(pub)], [2, data], [3, sn], [4, topic]]
-      seen.add(hex(await sha256(cat(enc('entmoot/pubsub-envelope/v2\0'), data))))
-      send([[2, pb([...fields, [5, await edSign(seed, cat(PUBSUB_SIG, pb(fields)))]])]])
-      return m.id
-    },
-    /** newest n verified stored messages matching pattern, oldest first */
-    async history (pattern, n = 50) {
-      const ids = []; let page = {}
-      do {
-        page = await rpc('/entmoot/history/2', {
-          version: 2, mode: 'list', limit: 1024, snapshot_token: page.snapshot_token, generation: page.generation,
-          after_timestamp_ms: page.next_timestamp_ms, after_author_member_id: page.next_author_member_id, after_message_id: page.next_message_id
-        })
+      await rpc('/entmoot/membership-push/1', { version: 1, capability: invite, record })
+      r = await asMember()
+      if (!r) throw Error('join record not applied by the node')
+    }
+
+    // GossipSub: subscribe only now that we are on the roster (the node drops non-member SUBSCRIBEs)
+    out = await conn.stream(MESHSUB)
+    send([[1, pb([[1, true], [2, topic]])], [3, pb([[3, pb([[1, topic]])]])]])
+
+    /** message ids of the group's stored history, oldest first (whole list; see README limits) */
+    const listIds = async () => {
+      let ids = []; let req = {}
+      for (let retries = 0; ;) {
+        let page
+        try {
+          page = await rpc(HISTORY, { version: 2, mode: 'list', limit: 1024, ...req })
+        } catch (e) {
+          // like Go's keeper sync: drop the expired token; a changed snapshot restarts the walk
+          if (e.res?.error !== 'snapshot_expired' || ++retries > 3) throw e
+          req = e.res.snapshot_changed ? (ids = [], {}) : { ...req, snapshot_token: undefined }
+          continue
+        }
         ids.push(...page.ids || [])
-      } while (page.has_more)
-      const got = []
-      for (let end = ids.length; end > 0 && got.length < n; end -= 64) {
-        const b = await rpc('/entmoot/history/2', { version: 2, mode: 'bodies', ids: ids.slice(Math.max(0, end - 64), end) })
-        for (const m of b.messages || []) if (m.topics?.some((t) => match(pattern, t)) && await verify(m)) got.push(decode(m))
+        if (!page.has_more) return ids
+        if (!page.ids?.length) throw Error('history: paging made no progress')
+        req = {
+          snapshot_token: page.snapshot_token, generation: page.generation,
+          after_timestamp_ms: page.next_timestamp_ms, after_author_member_id: page.next_author_member_id, after_message_id: page.next_message_id
+        }
       }
-      return got.sort((a, b) => a.timestamp - b.timestamp).slice(-n)
-    },
-    close () { conn.close() }
+    }
+
+    const g = {
+      me,
+      conn,
+      topic,
+      /** roster checkpoint id cited by new messages */
+      get rosterHead () { return r.canonical },
+      /** refresh and return the /entmoot/membership/1 answer (all checkpoints and records, canonical) */
+      async roster () { return (r = await roster()) },
+      /** call fn(msg) for every verified live message whose topics match pattern ("+", "#" wildcards) */
+      on (pattern, fn) { subs.push([pattern, fn]); return g },
+      /** sign and gossip a message; resolves with its id */
+      async publish (t, content) {
+        if (!validTopic(t)) throw Error('invalid topic: ' + JSON.stringify(t))
+        const m = await sign('message/v2', {
+          version: 2, group_id: groupId, author: me, timestamp: Date.now(), topics: [t],
+          content: b64(typeof content === 'string' ? enc(content) : content) || undefined, roster_head: r.canonical
+        }, seed)
+        const data = enc(JSON.stringify(m))
+        const sn = new Uint8Array(8); new DataView(sn.buffer).setBigUint64(0, ++seq)
+        const fields = [[1, peerIdBytes(pub)], [2, data], [3, sn], [4, topic]]
+        seen.add(hex(await sha256(cat(enc('entmoot/pubsub-envelope/v2\0'), data))))
+        send([[2, pb([...fields, [5, await edSign(seed, cat(PUBSUB_SIG, pb(fields)))]])]])
+        return m.id
+      },
+      /** newest n verified stored messages of this group matching pattern, oldest first */
+      async history (pattern, n = 50) {
+        const ids = await listIds()
+        const got = new Map()
+        for (let end = ids.length; end > 0 && got.size < n; end -= 64) {
+          let want = ids.slice(Math.max(0, end - 64), end)
+          while (want.length) {
+            const b = await rpc(HISTORY, { version: 2, mode: 'bodies', ids: want })
+            // only bodies we asked for, of this group; a truncated reply (has_more) is continued
+            const done = new Set(b.missing)
+            for (const m of b.messages || []) {
+              if (!want.includes(m.id) || done.has(m.id)) continue
+              done.add(m.id)
+              if (m.group_id === groupId && m.topics?.some((t) => match(pattern, t)) && await verify(m)) got.set(m.id, decode(m))
+            }
+            const rest = want.filter((id) => !done.has(id))
+            if (!b.has_more || rest.length === want.length) break
+            want = rest
+          }
+        }
+        return [...got.values()].sort((a, b) => a.timestamp - b.timestamp).slice(-n)
+      },
+      close () { conn.close() }
+    }
+    return g
+  } catch (e) {
+    conn.close()
+    throw e
   }
-  return g
 }
 
 const decode = (m) => ({ ...m, text: m.content ? dec(unb64(m.content)) : '' })

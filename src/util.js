@@ -37,6 +37,18 @@ export function varint (n) {
   o.push(n)
   return Uint8Array.from(o)
 }
+/**
+ * Read a minimal unsigned varint at b[i]: [value, next index], or undefined when b ends first.
+ * Throws once the value (or a continuation that would make it) exceeds max.
+ */
+export function uvarint (b, i, max) {
+  let n = 0
+  for (let s = 1; i < b.length; s *= 128) {
+    const x = b[i++]
+    n += (x & 127) * s
+    if (n > max || (x > 127 && s * 128 > max)) throw Error('varint out of range')
+    if (x < 128) return [n, i]
+  }
+}
 /** unsigned-varint length prefix */
 export const lp = (b) => cat(varint(b.length), b)
-export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))

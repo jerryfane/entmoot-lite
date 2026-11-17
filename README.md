@@ -7,7 +7,7 @@ ES module, small enough to go inside a Bitcoin inscription, and it runs inside o
 
 | file | raw | brotli |
 |---|---|---|
-| `dist/entmoot-lite.js` (the whole client) | 15.2 KB | **6.3 KB** |
+| `dist/entmoot-lite.js` (the whole client) | 17.9 KB | **7.2 KB** |
 
 The budget is 30 KB brotli. `npm run size` fails the build above it. For comparison, the js-libp2p probe this replaces
 was 132 KB brotli.
@@ -51,47 +51,83 @@ Only what Entmoot needs, in `src/`:
     accepts both.
   - The Noise prologue is `libp2p-webrtc-noise:` ‖ our DTLS fingerprint multihash ‖ the server certhash.
   - libp2p streams map one-to-one onto data channels, framed as varint-prefixed protobuf `{flag, message}` with
-    FIN/FIN_ACK/STOP_SENDING/RESET. No yamux is needed.
+    FIN/FIN_ACK/STOP_SENDING/RESET. No yamux is needed. The two halves of a stream close independently, and a peer's
+    RESET ends only our read half. Frames above the 16 KiB WebRTC message limit, overlong varints and malformed
+    protobuf end the stream with an error.
   - multistream-select 1.0.0, in both directions.
 - **`noise.js`**: `Noise_XX_25519_ChaChaPoly_SHA256`. The browser is the responder, as the WebRTC spec requires. It
-  checks the libp2p static-key signature and that the remote key matches the `/p2p/` peer id.
+  checks the libp2p static-key signature and that the remote key matches the `/p2p/` peer id. It refuses short
+  handshake messages and low-order X25519 keys (an all-zero shared secret).
 - **`crypto.js`**:
-  - X25519 (RFC 7748), Ed25519 sign/verify (RFC 8032, cofactorless and rejecting non-canonical S, like Go) and
-    ChaCha20-Poly1305 (RFC 8439), all in plain JS using BigInt and Uint32Array.
-  - SHA-256, SHA-512 and HMAC come from WebCrypto, which every WebRTC browser has.
-  - Nothing depends on WebCrypto curve support.
+  - **Operations on secret keys:** Ed25519 signing and X25519 key agreement use the browser's native WebCrypto
+    Ed25519/X25519 when it has them (see Browser support).
+  - **Fallback when they are missing:** small BigInt implementations (RFC 8032, RFC 7748). They run a fixed number
+    of steps, but BigInt arithmetic is not constant-time. A page on an older browser therefore signs with a
+    timing-variable implementation.
+  - **Ed25519 verify:** always the JS implementation, cofactorless and rejecting non-canonical S like Go, so that
+    every browser accepts exactly what Go accepts. Verifying involves no secret.
+  - **ChaCha20-Poly1305** (RFC 8439): in JS.
+  - **SHA-256, SHA-512 and HMAC:** come from WebCrypto.
 - **`pb.js`**: a hand-written protobuf encoder/decoder (varint and length-delimited fields only). Clients:
   - identify: answered, advertising `/meshsub/1.1.0`; without it GossipSub never adds us as a peer;
   - the gossipsub RPC: SUBSCRIBE, GRAFT, PUBLISH with a StrictSign signature, and IWANT in reply to IHAVE.
 - **`entmoot.js`**:
-  - Go `canonical.Encode`;
-  - message ids and signatures (`entmoot/message/v2\0`) and roster record signing (`entmoot/membership-record/v3\0`);
+  - Go `canonical.Encode`, including Go's handling of lone UTF-16 surrogates, which become U+FFFD;
+  - message ids and signatures, both v2 (`entmoot/message/v2\0`) and legacy v0 (no prefix, no member id);
+  - roster record signing (`entmoot/membership-record/v3\0`);
   - member id, and the topic name `/entmoot/group/2/<b64url sha256("entmoot/topic/v2\0"‖gid)>`;
   - the pubsub message id `sha256("entmoot/pubsub-envelope/v2\0"‖data)`;
-  - topic patterns.
+  - topic patterns, and Go's `ValidTopic` for publishing.
 - **`index.js`**: `join()` uses these Entmoot protocols:
-  - `/entmoot/membership/1`: roster fetch, authorized by the invite until we are a member;
-  - `/entmoot/membership-push/1`: a self-signed `join` record carrying the invite, exactly as `entmootd join` sends it;
-  - `/entmoot/history/2`: `list` pages, then `bodies` in batches of 64;
+  - `/entmoot/membership/1`: the roster, with checkpoint and record pages walked to completion.
+    - **Am I a member?** The client asks without the invite. The node answers a capability-less request only for a
+      key that its own roster projection counts as a member (joins, rekeys, removals, bans: Go's rules exactly), so
+      the client does not fold the roster itself.
+    - **Before joining:** the invite authorizes the roster read.
+  - `/entmoot/membership-push/1`: a self-signed `join` record carrying the invite, exactly as `entmootd join` sends
+    it.
+    - **Timestamp:** above the canonical checkpoint and every record the node holds, like the node's own record
+      writer (`membership/group.go`). Otherwise a browser clock that is behind gets the record refused as stale.
+    - **Confirmation:** the join counts only once the node serves us as a member.
+  - `/entmoot/history/2`:
+    - **`list`:** pages are walked. An expired snapshot token is dropped and the walk retried, and a changed
+      snapshot restarts the walk, as in Go's keeper sync.
+    - **`bodies`:** in batches of 64. A truncated reply (`has_more`) is continued with the ids not yet served.
+    - **Filtering:** only bodies we asked for, belonging to this group, are kept.
   - GossipSub on the group topic. We subscribe only once we are on the roster, because the node drops SUBSCRIBEs
     from non-members. The browser therefore receives live messages right after an invite join, with no reconnect
     (compare entmoot#247).
+  - **Cleanup:** if `join()` fails after dialing, it closes the connection.
 
 Every message it delivers, from history or live, is checked:
 - the id is recomputed from the canonical bytes;
 - the Ed25519 signature is verified;
-- the member id is re-derived from the key.
+- the member id is re-derived from the key;
+- the group id must match.
 
-The node has already checked roster membership and policy before storing or forwarding a message. The client does
-not re-check authors against the roster.
+### Trust boundary
+
+The client trusts the node it dials, which is authenticated by certhash, the Noise handshake and the peer id, for
+everything a signature cannot show:
+- **Authors:** it does not check that an author was a roster member when they wrote, or that `roster_head` names a
+  real checkpoint.
+- **Roster:** it does not verify checkpoint or record signatures, or recompute the roster.
+- **v0 messages:** legacy messages are accepted on their signature alone. The node's conversion-commitment proof
+  is not checked.
+
+A dishonest node can therefore replay or withhold messages, and serve messages that are authentic but were written
+by non-members. It cannot forge a message under someone else's key.
 
 ## Browser support
 
 - **Tested:** Chromium 159 (Playwright headless), inside `<iframe sandbox="allow-scripts">` with ord's CSP and an
   opaque origin, using both WebRTC-direct v1 (munged ufrag) and v2 (`--force-fieldtrials=WebRTC-NoSdpMangleUfrag/Enabled/`).
-- **Requirements:** `RTCPeerConnection`, BigInt, ES2022, and WebCrypto `subtle` (SHA-256/512, HMAC). `subtle` needs a
-  secure context. A sandboxed frame under an https page such as ordinals.com qualifies, and so does http://localhost.
-  WebCrypto Ed25519/X25519 are not needed.
+- **Requirements:** `RTCPeerConnection`, BigInt, ES2022, `String.prototype.toWellFormed` (Chrome 111, Firefox 119,
+  Safari 16.4), and WebCrypto `subtle` (SHA-256/512, HMAC). `subtle` needs a secure context. A sandboxed frame under
+  an https page such as ordinals.com qualifies, and so does http://localhost.
+- **Native secret-key crypto:** native WebCrypto Ed25519 (Chrome 137+, Firefox 129+, Safari 17+) and X25519
+  (Chrome 133+, Firefox 130+, Safari 17+) are used when present. Older browsers fall back to the JS code, which is
+  not constant-time.
 - **Untested:** Firefox and Safari. They should satisfy the API requirements [INFERENCE]. Whether each accepts a munged
   ufrag, or how it reports refusing one, has not been checked: the v2 fallback triggers on a
   `setLocalDescription` error.
@@ -125,17 +161,38 @@ ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> 
   - RFC 8032 (Ed25519), RFC 7748 (X25519), RFC 8439 (ChaCha20, Poly1305, AEAD) and RFC 4231 (HMAC) vectors;
   - cross-checks against `node:crypto` on random keys;
   - rejection of non-canonical signatures.
-- **Golden data** (`test/golden.json`, written by the e2e run with `E2E_GOLDEN=test/golden.json`):
-  - messages and roster checkpoint/records produced by a real `entmootd` (entmoot main 281b884). This includes
-    messages the browser authored and the node accepted and stored;
-  - our canonical bytes must reproduce Go's ids, and Go's signatures must verify over them;
-  - member ids and peer ids must match the node's.
+- **Golden data:**
+  - `test/golden.json` (written by the e2e run with `E2E_GOLDEN=test/golden.json`): messages and roster
+    checkpoint/records produced by a real `entmootd` (entmoot main 281b884). This includes messages the browser
+    authored and the node accepted and stored. Our canonical bytes must reproduce Go's ids, Go's signatures must
+    verify over them, and member ids and peer ids must match the node's.
+  - `test/golden-go.json` (written by `test/gen/golden-go.go` with entmoot's own Go code): a legacy v0 message,
+    and a message whose topic held a lone surrogate.
+- **Native crypto path:** signing and Noise DH go through WebCrypto Ed25519/X25519 when available, with the JS
+  fallback checked against RFC vectors.
 - **Wire:**
   - protobuf bytes;
   - multiaddr parsing → inferred SDP;
   - stream framing (split prefix/frame messages, chunking, FIN/FIN_ACK);
   - the Noise XX responder against an independent initiator written with `node:crypto`, including failure when the
     prologues differ.
+- **Hostile peers** (`test/hostile.test.js`), where anything that could spin the thread runs in a child process
+  with a deadline:
+  - overlong and oversized frame varints;
+  - malformed protobuf and frames;
+  - RESET and close-without-FIN;
+  - channels that close before they open;
+  - a seeded fuzz of random and mutated frames;
+  - low-order and truncated Noise keys.
+- **Join, membership, history and publish** (`test/join.test.js`), against a scripted fake `entmootd`
+  (`test/fake-node.js`) that runs the real dialer, Noise and multistream code over in-memory data channels:
+  - roster paging and rekeys;
+  - the join timestamp floor;
+  - cleanup when `join()` fails;
+  - truncated and foreign history bodies;
+  - expired snapshots;
+  - topic validation;
+  - closing streams that fail negotiation.
 
 **End-to-end** (`e2e/run.mjs`):
 - **Node setup:**
@@ -203,8 +260,9 @@ this is to carry admission over the same WebRTC-direct connection as a new libp2
 - **History only goes one way.** The node's own `/entmoot/history/2`, `/entmoot/peer-records/1` and membership pulls
   to the browser are refused with multistream `na`. This is safe: the node skips the peer. Nothing else can catch up
   from the browser.
-- **Rough membership check.** The "am I a member" check before joining reads the newest checkpoint and the records
-  that follow it. It does not fully reproduce Entmoot's roster rules (bans, revoked invites).
+- **History lists every id.** `history(pattern, n)` lists every stored message id (≤ 1024 per page) before fetching
+  bodies newest-first. Cost grows with the size of the group's history, not with `n`.
+- **Roster is not verified locally.** Membership is the node's answer; see Trust boundary.
 - **Limited gossip.** Gossip controls cover only SUBSCRIBE, GRAFT and IWANT. There is no IDONTWANT, PRUNE handling
   or peer scoring.
 - **Unbounded de-duplication.** The set of message ids already seen is not bounded for the lifetime of a page.

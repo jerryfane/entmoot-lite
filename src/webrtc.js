@@ -3,9 +3,10 @@
 import { random } from './crypto.js'
 import { respond, pubProto } from './noise.js'
 import { pb, unpb } from './pb.js'
-import { cat, enc, dec, eq, lp, unb58, unb64, hex } from './util.js'
+import { cat, enc, dec, eq, lp, unb58, unb64, hex, uvarint } from './util.js'
 
-const MAX = 16384 - 8 // SDP max-message-size minus pb + varint overhead
+const LIMIT = 16384 // SDP max-message-size: no frame from the peer can be larger
+const MAX = LIMIT - 8 // payload per frame we send, minus pb + varint overhead
 const ICE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
 const iceStr = () => [...random(32)].map((x) => ICE[x % 62]).join('')
 
@@ -31,38 +32,49 @@ export const serverSdp = ({ ipv, ip, port, hash }, ufrag) => [
 /**
  * A libp2p stream on one RTCDataChannel: a byte stream of varint-length-prefixed pb
  * {flag=1, message=2} frames (go-libp2p writes prefix and frame as separate SCTP messages).
+ * Read half: `eof` after the peer's FIN, `err` after RESET, a malformed frame or a close
+ * without FIN. Write half: `wr` once the peer acknowledged our FIN or sent STOP_SENDING.
+ * The channel closes when both halves are done.
  */
 export class Stream {
   constructor (dc) {
-    this.dc = dc; this.raw = this.buf = new Uint8Array(0); this.fin = false; this.wake = () => {}
+    this.dc = dc; this.raw = this.buf = new Uint8Array(0); this.wake = () => {}
     dc.binaryType = 'arraybuffer'
-    this.opened = dc.readyState === 'open' ? Promise.resolve() : new Promise((resolve, reject) => { dc.onopen = resolve; dc.onerror = reject })
+    this.opened = new Promise((resolve, reject) => {
+      if (dc.readyState === 'open') resolve()
+      else if (dc.readyState !== 'connecting') reject(Error('channel closed'))
+      dc.onopen = resolve
+      dc.onerror = dc.onclose = () => { reject(Error('channel closed')); if (!this.eof) this.fail(Error('channel closed')); this.wake() }
+    })
+    this.opened.catch(() => {}) // awaited by whoever needs it; a channel nobody waits on may just close
     dc.onmessage = (e) => {
-      let b = this.raw = cat(this.raw, new Uint8Array(e.data))
-      for (;;) {
-        let n = 0; let s = 1; let i = 0; let x
-        do { x = b[i++]; n += (x & 127) * s; s *= 128 } while (x > 127)
-        if (x === undefined || b.length < i + n) break
-        const m = unpb(b.subarray(i, i + n)); b = this.raw = b.subarray(i + n)
-        if (m[2]) this.buf = cat(this.buf, m[2][0])
-        const f = m[1]?.[0]
-        if (f === 0) { this.fin = true; this.frame([[1, 3]]) } // FIN -> FIN_ACK
-        if (f === 1 || f === 3) this.acked = true // STOP_SENDING / FIN_ACK: our half is done
-        if (f === 2) this.fin = this.acked = true // RESET
-        if (this.fin && this.acked) this.close()
-      }
+      if (dc.readyState === 'closed') return
+      try {
+        let b = cat(this.raw, new Uint8Array(e.data)); let v
+        while ((v = uvarint(b, 0, LIMIT)) && b.length >= v[0] + v[1]) {
+          const m = unpb(b.subarray(v[1], v[0] + v[1])); b = b.subarray(v[0] + v[1])
+          if (m[2] && !this.eof && !this.err) this.buf = cat(this.buf, m[2][0])
+          const f = m[1]?.[0]
+          if (f === 0) { this.eof = true; this.frame([[1, 3]]) } // FIN -> FIN_ACK
+          if (f === 2) this.err ||= Error('stream reset') // the peer abandoned its send half only
+          if (f === 1 || f === 3) this.wr = true // STOP_SENDING / FIN_ACK
+        }
+        this.raw = b
+        if ((this.eof || this.err) && this.wr) this.close()
+      } catch (err) { this.fail(err) }
       this.wake()
     }
-    dc.onclose = () => { this.fin = true; this.wake() }
   }
 
+  fail (e) { this.err ||= e; this.close(); this.wake() }
   frame (fields) { if (this.dc.readyState === 'open') this.dc.send(lp(pb(fields))) }
   write (b) { for (let i = 0; i < b.length; i += MAX) this.frame([[2, b.subarray(i, i + MAX)]]) }
   /** close our write half (FIN); the data channel closes once the remote acknowledges. */
   end () { this.frame([[1, 0]]) }
   close () { if (this.dc.readyState !== 'closed') this.dc.close() }
   async more () {
-    if (this.fin) throw Error('stream ended')
+    if (this.err) throw this.err
+    if (this.eof) throw Error('stream ended')
     await new Promise((resolve) => { this.wake = resolve })
   }
 
@@ -71,15 +83,19 @@ export class Stream {
     const o = this.buf.subarray(0, n); this.buf = this.buf.subarray(n); return o
   }
 
-  /** one unsigned-varint length-prefixed frame */
-  async lp () {
-    let n = 0; let s = 1; let x
-    do { x = (await this.read(1))[0]; n += (x & 127) * s; s *= 128 } while (x > 127)
-    return this.read(n)
+  /** one unsigned-varint length-prefixed message of at most max bytes */
+  async lp (max = 1 << 20) {
+    try {
+      let v
+      while (!(v = uvarint(this.buf, 0, max))) await this.more()
+      this.buf = this.buf.subarray(v[1])
+      return await this.read(v[0])
+    } catch (e) { this.fail(e); throw e }
   }
 
+  /** everything up to the peer's FIN; a reset or a close without FIN rejects */
   async all () {
-    while (!this.fin) await this.more()
+    while (!this.eof) await this.more()
     const o = this.buf; this.buf = new Uint8Array(0); return o
   }
 }
@@ -116,9 +132,11 @@ export async function dial (addr, seed, pub, handlers, timeout = 20000) {
     closed: new Promise((resolve) => { pc.onconnectionstatechange = () => /failed|closed|disconnected/.test(pc.connectionState) && resolve() }),
     async stream (proto, first) {
       const st = new Stream(pc.createDataChannel(''))
-      await st.opened
-      await select(st, proto, first)
-      return st
+      try {
+        await st.opened
+        await select(st, proto, first)
+        return st
+      } catch (e) { st.close(); throw e }
     },
     close () { pc.close() }
   }

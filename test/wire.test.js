@@ -69,7 +69,7 @@ test('stream framing: split prefix/frame messages, FIN/FIN_ACK half-close', asyn
   sa.end()
   const all = await sb.all()
   assert.equal(all.length, 40000)
-  assert.equal(sb.fin, true)
+  assert.equal(sb.eof, true)
   sb.end() // our FIN -> their FIN_ACK; both halves done closes the channel
   assert.equal(da.readyState, 'closed')
 })

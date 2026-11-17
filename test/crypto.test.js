@@ -110,3 +110,45 @@ test('hmac / sha256 via WebCrypto', async () => {
   assert.equal(hx(await hmac(new TextEncoder().encode('Jefe'), new TextEncoder().encode('what do ya want for nothing?'))),
     '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843')
 })
+
+// Secret-key operations go through WebCrypto (native, constant-time) when the browser has
+// Ed25519/X25519; the BigInt code is only a fallback.
+async function spying (fn) {
+  const calls = []
+  const s = crypto.subtle
+  const orig = { sign: s.sign, deriveBits: s.deriveBits }
+  s.sign = function (alg, ...a) { calls.push('sign:' + (alg.name || alg)); return orig.sign.call(this, alg, ...a) }
+  s.deriveBits = function (alg, ...a) { calls.push('deriveBits:' + (alg.name || alg)); return orig.deriveBits.call(this, alg, ...a) }
+  try { await fn() } finally { Object.assign(s, orig) }
+  return calls
+}
+
+test('edSign uses WebCrypto Ed25519 when available', async () => {
+  const [sk, , msg, sig] = ED[1]
+  let out
+  const calls = await spying(async () => { out = await edSign(h(sk), h(msg)) })
+  assert.ok(calls.includes('sign:Ed25519'), calls.join())
+  assert.equal(hx(out), sig)
+})
+
+test('edSign / edPublic fall back to JS when WebCrypto lacks Ed25519', async () => {
+  const s = crypto.subtle; const orig = s.importKey
+  s.importKey = function (fmt, data, alg, ...a) { if ((alg.name || alg) === 'Ed25519') return Promise.reject(Error('NotSupportedError')); return orig.call(this, fmt, data, alg, ...a) }
+  try {
+    for (const [sk, pk, msg, sig] of ED) {
+      assert.equal(hx(await edPublic(h(sk))), pk)
+      assert.equal(hx(await edSign(h(sk), h(msg))), sig)
+    }
+  } finally { s.importKey = orig }
+})
+
+test('noise handshake DH runs on WebCrypto X25519 when available', async () => {
+  const { respond } = await import('../src/noise.js')
+  const calls = await spying(async () => {
+    // a valid ephemeral, then nothing: we only need the responder's own DH steps
+    const peer = nc.generateKeyPairSync('x25519').publicKey.export({ format: 'der', type: 'spki' }).subarray(12)
+    let n = 0
+    await Promise.race([respond({ read: async () => n++ ? new Promise(() => {}) : peer, write () {} }, new Uint8Array(0), h(ED[0][0]), h(ED[0][1])), new Promise((resolve) => setTimeout(resolve, 500))])
+  })
+  assert.ok(calls.includes('deriveBits:X25519'), calls.join())
+})

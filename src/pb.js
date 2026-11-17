@@ -1,5 +1,5 @@
 // Hand-rolled protobuf (proto2/3 wire format): only varints and length-delimited fields.
-import { cat, enc, varint } from './util.js'
+import { cat, enc, uvarint, varint } from './util.js'
 
 /**
  * Encode fields in the given order: pb([[1, bytes|string|number|bool|array], ...]).
@@ -18,18 +18,19 @@ export function pb (fields) {
   return cat(...out)
 }
 
-/** Decode to {field: [values]}; varints as numbers, length-delimited as Uint8Array. */
+/** Decode to {field: [values]}; varints as numbers, length-delimited as Uint8Array. Throws on malformed input. */
 export function unpb (b) {
   const o = {}
   let i = 0
-  const vi = () => { let n = 0; let s = 1; let x; do { x = b[i++]; n += (x & 127) * s; s *= 128 } while (x > 127); return n }
+  const vi = () => { const v = uvarint(b, i, Number.MAX_SAFE_INTEGER); if (!v) throw Error('pb truncated'); i = v[1]; return v[0] }
   while (i < b.length) {
-    const k = vi(); const f = Math.floor(k / 8); const t = k & 7
+    const k = vi(); const t = k % 8
     let v
     if (t === 0) v = vi()
-    else if (t === 2) { const n = vi(); v = b.subarray(i, i += n) } else if (t === 1 || t === 5) { i += t === 1 ? 8 : 4; continue } else throw Error('pb wire type ' + t)
+    else if (t === 2) { const n = vi(); v = b.subarray(i, i += n) } else if (t === 1 || t === 5) i += t === 1 ? 8 : 4
+    else throw Error('pb wire type ' + t)
     if (i > b.length) throw Error('pb truncated')
-    ;(o[f] ||= []).push(v)
+    if (v !== undefined) (o[(k - t) / 8] ||= []).push(v)
   }
   return o
 }

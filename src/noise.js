@@ -2,7 +2,7 @@
 // is the Noise RESPONDER, the server initiates. Only the handshake runs; the WebRTC connection
 // is already encrypted by DTLS and Noise just binds both libp2p identities to the DTLS
 // fingerprints through the prologue.
-import { random, sha256, hmac, x25519, seal, open, edSign, edVerify } from './crypto.js'
+import { sha256, hmac, xKeyPair, seal, open, edSign, edVerify } from './crypto.js'
 import { pb, unpb } from './pb.js'
 import { cat, enc } from './util.js'
 
@@ -34,27 +34,28 @@ class Sym {
 export async function respond (io, prologue, seed, pub) {
   const s = new Sym()
   await s.mix(prologue)
-  const sk = random(32); const spub = x25519(sk)
-  const ek = random(32); const epub = x25519(ek)
-  // <- e
+  const st = await xKeyPair(); const eph = await xKeyPair()
+  // <- e   (the ephemeral key, then an unencrypted, normally empty payload)
   const m1 = await io.read()
+  if (m1.length < 32) throw Error('noise: short message')
   const re = m1.subarray(0, 32)
   await s.mix(re)
   await s.dec(m1.subarray(32))
-  // -> e, ee, s, es, payload
-  await s.mix(epub)
-  await s.mixKey(x25519(ek, re))
-  const cs = await s.enc(spub)
-  await s.mixKey(x25519(sk, re))
-  const payload = pb([[1, pubProto(pub)], [2, await edSign(seed, cat(SIG_PREFIX, spub))]])
-  io.write(cat(epub, cs, await s.enc(payload)))
-  // <- s, se, payload
+  // -> e, ee, s, es, payload   (dh() refuses low-order keys: an all-zero secret)
+  await s.mix(eph.pub)
+  await s.mixKey(await eph.dh(re))
+  const cs = await s.enc(st.pub)
+  await s.mixKey(await st.dh(re))
+  const payload = pb([[1, pubProto(pub)], [2, await edSign(seed, cat(SIG_PREFIX, st.pub))]])
+  io.write(cat(eph.pub, cs, await s.enc(payload)))
+  // <- s, se, payload   (48-byte encrypted static key, then an encrypted payload of >= 16 bytes)
   const m3 = await io.read()
+  if (m3.length < 64) throw Error('noise: short message')
   const rs = await s.dec(m3.subarray(0, 48))
-  await s.mixKey(x25519(ek, rs))
+  await s.mixKey(await eph.dh(rs))
   const p = unpb(await s.dec(m3.subarray(48)))
-  const key = unpb(p[1][0])
+  const key = unpb(p[1]?.[0] || [])
   const rpub = key[2]?.[0]
-  if (key[1]?.[0] !== 1 || !rpub || !await edVerify(rpub, cat(SIG_PREFIX, rs), p[2][0])) throw Error('noise: bad remote identity')
+  if (key[1]?.[0] !== 1 || !rpub || !p[2] || !await edVerify(rpub, cat(SIG_PREFIX, rs), p[2][0])) throw Error('noise: bad remote identity')
   return rpub
 }

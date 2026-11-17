@@ -80,3 +80,20 @@ test('topic patterns', () => {
   assert.ok(!match('world/chat', 'world/chatter'))
   assert.ok(match('#', 'anything/here'))
 })
+
+// test/golden-go.json: written by entmoot's own Go code (test/gen/golden-go.go).
+const goldenGo = JSON.parse(readFileSync(new URL('./golden-go.json', import.meta.url)))
+
+test('legacy v0 messages (no domain prefix, no member id) verify like Go', async () => {
+  const m = goldenGo.legacy
+  assert.ok(await verify(m))
+  assert.equal(await verify({ ...m, timestamp: m.timestamp + 1 }), false)
+  assert.equal(await verify({ ...m, version: 1 }), false, 'unknown versions are refused like Go')
+})
+
+test('canonical form maps lone surrogates to U+FFFD like Go', async () => {
+  // what a JS page holds before sending: JSON.parse of the escape Go received
+  const local = { ...goldenGo.surrogate, topics: [JSON.parse(`"${goldenGo.surrogate_sent_topic}"`)] }
+  assert.equal(local.topics[0], 'a\ud800b')
+  assert.ok(await verify(local))
+})
