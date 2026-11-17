@@ -1,0 +1,19 @@
+{
+  "name": "entmoot-lite",
+  "version": "0.1.0",
+  "description": "Dependency-free browser client for Entmoot groups over libp2p WebRTC-direct, small enough for a Bitcoin inscription",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jerry Fanelli",
+  "main": "dist/entmoot-lite.js",
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "size": "node scripts/build.mjs && node scripts/size.mjs",
+    "test": "node --test test/*.test.js",
+    "e2e": "node e2e/run.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  }
+}

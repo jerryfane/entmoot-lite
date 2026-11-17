@@ -1,0 +1,32 @@
+{
+ "legacy": {
+  "id": "Nbqt86Yn46qfP+p8Db1Ng8IoS4lVxj0xyquXX443jTk=",
+  "group_id": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "author": {
+   "pilot_node_id": 7,
+   "entmoot_pubkey": "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik="
+  },
+  "timestamp": 1700000000000,
+  "topics": [
+   "legacy/chat"
+  ],
+  "content": "ZnJvbSB0aGUgcGlsb3QgZXJh",
+  "signature": "8rRb1q3iLCgXnVoUdvWc+Nz51Ic7vKM1TvcgxqrR8v8nTHMdtrhYVXgyeSEPdD+nFJUXtp2TUCXiAq9HLKlQCw=="
+ },
+ "surrogate": {
+  "id": "AtdL0MMnchqlfBmKcxOKh9OSVbChLGm+pZU7K6BKLOU=",
+  "version": 2,
+  "group_id": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "author": {
+   "entmoot_pubkey": "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik=",
+   "member_id": "vskeE1a2SQn7inzANCQ9my0asuTnkRXEFx/eJqSj2Ik="
+  },
+  "timestamp": 1700000000001,
+  "topics": [
+   "a�b"
+  ],
+  "roster_head": "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "signature": "UtCrFrz7NqpwJqr4w3/RYV0ai5IrpMhcDFbMVi2hmW6Udo7Ti7TD8Ndht0AW7gQVt90s02Si5NbdC6iYt27BBw=="
+ },
+ "surrogate_sent_topic": "a\\ud800b"
+}
