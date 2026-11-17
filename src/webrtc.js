@@ -129,10 +129,12 @@ async function accept (st, handlers) {
 export async function dial (addr, seed, pub, handlers, timeout = 20000) {
   const a = parseAddr(addr)
   const pc = new RTCPeerConnection()
+  let ended
   const conn = {
     pc,
     version: 1, // WebRTC-direct ufrag scheme used (2 when the browser refuses SDP munging)
-    closed: new Promise((resolve) => { pc.onconnectionstatechange = () => /failed|closed|disconnected/.test(pc.connectionState) && resolve() }),
+    /** resolves once the connection is gone: ICE failed or disconnected, the node closed it, or close() */
+    closed: new Promise((resolve) => { ended = resolve }),
     async stream (proto, first) {
       const st = new Stream(pc.createDataChannel(''))
       try {
@@ -141,8 +143,10 @@ export async function dial (addr, seed, pub, handlers, timeout = 20000) {
         return st
       } catch (e) { st.close(); throw e }
     },
-    close () { pc.close() }
+    // pc.close() fires no connectionstatechange, so a local close ends `closed` itself
+    close () { pc.close(); ended() }
   }
+  pc.onconnectionstatechange = () => /failed|closed|disconnected/.test(pc.connectionState) && ended()
   let timer
   try {
     return await Promise.race([connect(), new Promise((resolve, reject) => { timer = setTimeout(() => reject(Error('dial timeout')), timeout) })])

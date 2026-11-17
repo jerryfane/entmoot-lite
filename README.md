@@ -22,7 +22,8 @@ const g = await join({
   groupId: 'bLF0…=',                                          // base64 group id
   key,                                                         // 32-byte Ed25519 seed (Uint8Array or base64), never stored
   invite,                                                      // target-bound invite JSON for this key; omit if already a member
-  onerror                                                      // optional: errors in live processing (default console.error)
+  onerror,                                                     // optional: errors in live processing (default console.error)
+  onreconnect                                                  // optional: called when a dropped connection is back
 })
 g.on('world/#', (msg) => console.log(msg.text, msg))   // live, verified; "+" / "#" topic wildcards
 await g.publish('world/chat', 'hello')                 // signs + gossips; resolves with the message id
@@ -35,7 +36,18 @@ g.close()
 - `g.me` holds `{entmoot_pubkey, member_id, peer_id}`.
 - `g.rosterHead` is the checkpoint id that new messages cite.
 - `g.roster()` returns the raw `/entmoot/membership/1` reply.
-- `g.conn.version` is the WebRTC-direct ufrag scheme that was used (1 or 2).
+- `g.conn.version` is the WebRTC-direct ufrag scheme that was used (1 or 2). `g.conn` is null while reconnecting.
+- **Reconnect.** If the connection to the node drops, the client dials again by itself, with the same key and
+  without the invite.
+  - **Backoff:** it waits 1, 2, 5 and 10 s before the first four attempts, then 30 s between attempts.
+  - **Drop detection:** a failed or closed WebRTC connection, or a libp2p ping (`/ipfs/ping/1.0.0`, every 15 s)
+    that gets no answer within 10 s. The ping is what notices a restarted node: the new process answers ICE on the
+    same port, so the old connection still looks connected.
+  - **Back online:** it subscribes again, then delivers once, oldest first, the stored messages from up to 30 s
+    before the drop that it never delivered (`msg.late === true`). Then it calls `onreconnect()`.
+  - **While it is down:** `g.connected` is false, and `publish()` and `history()` reject with `e.code === 'offline'`.
+  - **Gives up** only if the node no longer counts the key as a member (reported to `onerror`). `g.close()` stops it.
+  - Each failed attempt is reported to `onerror`.
 - `onerror(e)` receives errors that happen while live traffic is processed: a throwing `on()` handler, an RPC that
   fails to decode, or a failure inside the client. Delivery continues afterwards. A message that fails its signature
   check is not an error and is dropped quietly, but a check that cannot run (for example a broken WebCrypto) is
@@ -216,6 +228,12 @@ ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> 
   - closing streams that fail negotiation;
   - live delivery on the node-opened `/meshsub` stream, which continues after a throwing handler or an undecodable
     RPC; a failure inside verification reaches `onerror`.
+- **Reconnect** (`test/reconnect.test.js`, `test/reconnect-clock.test.js` with a fake clock, both on
+  `test/member-node.js`):
+  - **Drop and recovery:** after a dropped connection, the client dials again, subscribes on the new connection,
+    delivers the stored message it missed once (late), then live messages again.
+  - **Timing and control:** the backoff (1, 2, 5, 10, then 30 s); offline `publish`/`history` rejecting with
+    `offline`; `close()` during the backoff; a removed member giving up; a node that stops answering pings.
 - **The built module** (`test/dist.test.js`): `dist/entmoot-lite.js` inlined as a classic script.
   - **Scope:** it adds no globals besides its API.
   - **Name clashes:** verification still passes after the page overwrites every one- and two-letter global name.
@@ -232,7 +250,12 @@ ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> 
   1. **invite**: join with an invite, read history, receive a live message that the node publishes, and publish a
      message that the node must store;
   2. **member**: the same key with no invite, as a roster member;
-  3. **v2**: a fresh key, with Chromium refusing SDP munging.
+  3. **v2**: a fresh key, with Chromium refusing SDP munging;
+  4. **reconnect**: a member page whose connection drops twice must come back on its own.
+     - The page closes its own transport.
+     - `entmootd` is stopped and started again. A message the node stores while the page is away arrives once,
+       late.
+     - After each drop, a live message from the node arrives, and a message from the page is stored.
 - **Cleanup:** stops the node at the end, and writes `last-e2e.json` into the data dir.
 
 ## Membership for an inscription (design; not built yet)
@@ -281,9 +304,10 @@ this is to carry admission over the same WebRTC-direct connection as a new libp2
 
 ## Limits
 
-- **One node connection, no reconnect.** The client talks to one node and does not mesh with other peers. If that
-  node restarts or the connection drops, the page goes quiet: no live messages in or out until the page calls
-  `join` again (in practice: reloads). There is no automatic reconnect.
+- **One node connection.** The client talks to one node and does not mesh with other peers. If that node restarts
+  or the connection drops, nothing comes in or goes out until the reconnect (see API): about 1 s after a dropped
+  connection, ≤ 25 s plus the backoff after a node restart (measured 20.5 s in the e2e test). Messages from more
+  than 30 s before the drop that were missed are not re-delivered; `history()` still has them.
 - **Reload with the same key: up to ~35 s without live messages.** One key is one libp2p peer id. If a page goes
   away without closing its connection (crash, killed tab) and the same key joins again, the node keeps the old
   connection until it times out, and in the meantime delivers nothing live to the new page (measured 34.6–35.5 s
