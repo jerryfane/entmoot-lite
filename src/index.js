@@ -68,15 +68,23 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
   let attemptCtl = null // aborts the connection attempt in progress (its dial and its connection)
   let contended = false // the drops look like another session with this key (see CONTENDED_AFTER)
   let stopped = null // set (code 'replaced') once another page of this browser took the key over
+  // This page's session: a random id and when it started. Of two sessions of one key, the one that started
+  // later (ties: the larger id) is the newer one, and only an announcement of a newer session stops a page.
+  // So a takeover always favours the newer tab, and an older tab reconnecting can't stop the newer one.
   const session = hex(random(16))
+  const started = Date.now()
+  let established = false // this session has been connected at least once
+  const newer = (d) => typeof d?.session === 'string' && d.session !== session && Number.isFinite(d.started) &&
+    (d.started > started || (d.started === started && d.session > session))
   let channel = null
   try {
     if (typeof BroadcastChannel === 'function') {
       channel = new BroadcastChannel('entmoot-lite-' + hex(await sha256(cat(enc(SESSION_TOPIC), pub))).slice(0, 32))
-      channel.onmessage = (e) => { if (e.data?.session && e.data.session !== session && conn) replaced() }
+      // honoured while connected, in backoff or mid-attempt: replaced() cancels the waits and the attempt
+      channel.onmessage = (e) => { if (established && newer(e.data)) replaced() }
     }
   } catch { channel = null } // no BroadcastChannel (or blocked in this context): only the 'contended' hint
-  const announce = () => { try { channel?.postMessage({ session, at: Date.now() }) } catch {} }
+  const announce = () => { try { channel?.postMessage({ session, started, at: Date.now() }) } catch {} }
   let contendedTries = 0 // reconnect attempts since it looked contended: 60 s before the first, then 5 min
   const shortDrops = []
   // Every wait (backoff, ping interval, ping and attempt deadlines) is cancelled by close().
@@ -192,6 +200,7 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
       ctl.signal.removeEventListener('abort', abort)
       conn = c; out = o; r = m
       c.at = Date.now()
+      established = true
       announce()
       subscribe()
       c.closed.then(() => dropped(c))
@@ -239,6 +248,7 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
       onerror(Object.assign(Error('this key keeps losing its connection right after connecting: it may be open in another tab or agent'), { code: 'contended' }))
     }
     for (let i = 0; ; i++) {
+      if (closing) return // a user callback (onerror) may have called close()
       await wait(contended ? CONTENDED_RETRY_MS[Math.min(contendedTries++, CONTENDED_RETRY_MS.length - 1)] : RETRY_MS[Math.min(i, RETRY_MS.length - 1)], 'backoff')
       if (closing) return
       // one deadline for the whole attempt (dial included): a node that accepts the connection but never
