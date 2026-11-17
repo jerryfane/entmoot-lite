@@ -4,12 +4,12 @@
 //
 // Env (defaults in brackets):
 //   ENTMOOTD        entmootd binary built from entmoot main with entmoot#252 (required)
-//   E2E_DIR         node data dir [/root/fleet-tools/state/ordinals-lab/entmoot-webrtc/lite-e2e]
+//   E2E_DIR         node data dir; created if missing, never ~/.entmoot (required)
 //   E2E_PORT        UDP port of the webrtc-direct listener [47210]
-//   E2E_PUBLIC_IP   address announced and dialed [37.27.59.89]
+//   E2E_PUBLIC_IP   this machine's public IPv4, announced and dialed (required)
 //   E2E_LOG_LEVEL   entmootd -log-level [info]
 //   E2E_GOLDEN      if set, write node-produced messages + roster to this path (test/golden.json)
-//   PLAYWRIGHT      playwright module [/root/ordstudio/frontend/node_modules/playwright/index.mjs]
+//   PLAYWRIGHT      playwright module path ['playwright']
 //
 // It starts entmootd with its own data dir (never ~/.entmoot), creating the identity and a
 // private test group on first use, and mints a target-bound invite for a fresh browser key with
@@ -29,14 +29,14 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { randomBytes, createPrivateKey, createPublicKey } from 'node:crypto'
 
 const env = process.env
-const BIN = env.ENTMOOTD
-const DIR = env.E2E_DIR || '/root/fleet-tools/state/ordinals-lab/entmoot-webrtc/lite-e2e'
+const need = (k) => env[k] || (console.error(`e2e: set ${k} (see the header of e2e/run.mjs)`), process.exit(2))
+const BIN = need('ENTMOOTD')
+const DIR = need('E2E_DIR')
 const PORT = +(env.E2E_PORT || 47210)
-const IP = env.E2E_PUBLIC_IP || '37.27.59.89'
-const PW = env.PLAYWRIGHT || '/root/ordstudio/frontend/node_modules/playwright/index.mjs'
+const IP = need('E2E_PUBLIC_IP')
+const PW = env.PLAYWRIGHT || 'playwright'
 const ROOT = new URL('..', import.meta.url).pathname
 const CSP = "default-src 'self' 'unsafe-eval' 'unsafe-inline' data: blob:"
-if (!BIN) throw Error('set ENTMOOTD to an entmootd binary')
 if (DIR.includes('/.entmoot')) throw Error('refusing to use a real entmoot data dir')
 mkdirSync(DIR, { recursive: true })
 

@@ -117,7 +117,7 @@ The dial address is the invite's `allowed_multiaddrs` entry that contains `/webr
 npm ci
 npm test           # node:test unit tests
 npm run size       # build dist/ and enforce the 30 KB brotli budget
-ENTMOOTD=/path/to/entmootd npm run e2e   # browser end-to-end against a real node (see e2e/run.mjs)
+ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> npm run e2e   # browser end-to-end against a real node (see e2e/run.mjs)
 ```
 
 **Unit tests** (`test/`), run by CI on every push:
