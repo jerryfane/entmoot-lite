@@ -26,13 +26,24 @@ const offline = () => Object.assign(Error('not connected to the node (reconnecti
 const closedError = () => Object.assign(Error('closed'), { code: 'closed' })
 /**
  * One key is one connection on the node: a second page (tab, agent) with the same key closes the first
- * one's connection. Two such pages that both reconnect would close each other forever. A connection that
- * drops within SHORT_MS of being made counts as short; REPLACED_AFTER short drops within REPLACED_WINDOW_MS
- * means another session holds this key, and the client stops (code 'replaced').
+ * one's connection, so two such pages that both reconnect would knock each other off forever. A connection
+ * that drops within SHORT_MS of being made counts as short; CONTENDED_AFTER short drops within
+ * CONTENDED_WINDOW_MS look like that fight. It is not proof (a flaky network looks the same), so the client
+ * keeps reconnecting, only slower (CONTENDED_RETRY_MS), and reports code 'contended' once. A connection that
+ * then lasts SHORT_MS ends it.
  */
 const SHORT_MS = 30000
-const REPLACED_WINDOW_MS = 60000
-const REPLACED_AFTER = 3
+/**
+ * Positive evidence of another session, same browser only: every connection announces itself on a
+ * BroadcastChannel named from a hash of the PUBLIC key; a page that hears another session of its key stops
+ * for good (code 'replaced'). Pages only hear each other within one origin: an inscription opened top-level
+ * (e.g. on ordinals.com) shares that origin with other tabs of the site; in ord's sandboxed iframe the origin
+ * is opaque and every page is alone, so there only the 'contended' hint applies.
+ */
+const SESSION_TOPIC = 'entmoot-lite/session/v1\0'
+const CONTENDED_WINDOW_MS = 60000
+const CONTENDED_AFTER = 3
+const CONTENDED_RETRY_MS = [60000, 300000]
 
 /**
  * @param {object} o
@@ -54,8 +65,19 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
   const delivered = new Set() // Entmoot ids delivered to on() or published by us: each message once
   let seq = BigInt(Date.now()) * 1000000n
   let conn; let r; let closing = false; let joinedAt = 0
-  let candidate = null // a connection being set up by a reconnect attempt, not yet committed
-  let stopped = null // the error that ended the session for good ('replaced'), if any
+  let attemptCtl = null // aborts the connection attempt in progress (its dial and its connection)
+  let contended = false // the drops look like another session with this key (see CONTENDED_AFTER)
+  let stopped = null // set (code 'replaced') once another page of this browser took the key over
+  const session = hex(random(16))
+  let channel = null
+  try {
+    if (typeof BroadcastChannel === 'function') {
+      channel = new BroadcastChannel('entmoot-lite-' + hex(await sha256(cat(enc(SESSION_TOPIC), pub))).slice(0, 32))
+      channel.onmessage = (e) => { if (e.data?.session && e.data.session !== session && conn) replaced() }
+    }
+  } catch { channel = null } // no BroadcastChannel (or blocked in this context): only the 'contended' hint
+  const announce = () => { try { channel?.postMessage({ session, at: Date.now() }) } catch {} }
+  let contendedTries = 0 // reconnect attempts since it looked contended: 60 s before the first, then 5 min
   const shortDrops = []
   // Every wait (backoff, ping interval, ping and attempt deadlines) is cancelled by close().
   const waits = new Set()
@@ -137,14 +159,17 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
 
   /**
    * dial, become (or confirm we are) a member, subscribe; the invite is used only by the first connection.
-   * `attempt` (reconnects): {abandoned} is set when the attempt ran out of time; the connection is only
-   * committed if neither that nor close() happened meanwhile.
+   * `ctl` (AbortController) owns the attempt: aborting it (close(), or the attempt deadline) closes the
+   * RTCPeerConnection at once, during the dial or after it, and the connection is only committed if it
+   * was not aborted. `dialMs` caps the dial.
    */
-  const connect = async (first, attempt = {}) => {
-    const c = await dial(addr, seed, pub, handlers, timeout)
-    if (closing || attempt.abandoned) { c.close(); throw closing ? closedError() : Error('reconnect attempt timed out') }
-    candidate = attempt.c = c
+  const connect = async (first, ctl, dialMs = timeout) => {
+    attemptCtl = ctl
+    const c = await dial(addr, seed, pub, handlers, dialMs, ctl.signal)
+    const abort = () => c.close()
+    ctl.signal.addEventListener('abort', abort, { once: true })
     try {
+      if (ctl.signal.aborted) throw ctl.signal.reason
       let m = await asMember(c)
       if (!m) {
         if (!first) throw Object.assign(Error('no longer a member of this group'), { fatal: true })
@@ -163,10 +188,11 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
       }
       // GossipSub: subscribe only now that we are on the roster (the node drops non-member SUBSCRIBEs)
       const o = await c.stream(MESHSUB)
-      if (closing) throw closedError()
-      if (attempt.abandoned) throw Error('reconnect attempt timed out')
+      if (ctl.signal.aborted) throw ctl.signal.reason
+      ctl.signal.removeEventListener('abort', abort)
       conn = c; out = o; r = m
       c.at = Date.now()
+      announce()
       subscribe()
       c.closed.then(() => dropped(c))
       keepalive(c)
@@ -175,7 +201,7 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
       c.close()
       throw e
     } finally {
-      if (candidate === c) candidate = null
+      if (attemptCtl === ctl) attemptCtl = null
     }
   }
 
@@ -206,28 +232,24 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
     const at = Date.now()
     conn = null; out = null
     c.close()
-    if (at - c.at < SHORT_MS) shortDrops.push(at)
-    while (shortDrops.length && shortDrops[0] < at - REPLACED_WINDOW_MS) shortDrops.shift()
-    if (shortDrops.length >= REPLACED_AFTER) {
-      stopped = Object.assign(Error('another session with this key took over the connection (another tab or agent?)'), { code: 'replaced' })
-      for (const stop of [...waits]) stop()
-      return onerror(stopped)
+    if (at - c.at >= SHORT_MS) { shortDrops.length = 0; contended = false; contendedTries = 0 } else shortDrops.push(at)
+    while (shortDrops.length && shortDrops[0] < at - CONTENDED_WINDOW_MS) shortDrops.shift()
+    if (shortDrops.length >= CONTENDED_AFTER && !contended) {
+      contended = true
+      onerror(Object.assign(Error('this key keeps losing its connection right after connecting: it may be open in another tab or agent'), { code: 'contended' }))
     }
     for (let i = 0; ; i++) {
-      await wait(RETRY_MS[Math.min(i, RETRY_MS.length - 1)], 'backoff')
+      await wait(contended ? CONTENDED_RETRY_MS[Math.min(contendedTries++, CONTENDED_RETRY_MS.length - 1)] : RETRY_MS[Math.min(i, RETRY_MS.length - 1)], 'backoff')
       if (closing) return
-      // one deadline for the whole attempt: a node that accepts the connection but never answers the
-      // membership request (or the subscription) must not stop the reconnecting
-      const attempt = {}
+      // one deadline for the whole attempt (dial included): a node that accepts the connection but never
+      // answers the membership request (or the subscription) must not stop the reconnecting. On expiry the
+      // attempt is aborted, which closes its RTCPeerConnection before the next attempt dials.
+      const ctl = new AbortController()
       const deadline = wait(clock.attemptMs, 'deadline')
-      const done = connect(false, attempt)
+      const done = connect(false, ctl, Math.min(timeout ?? clock.attemptMs, clock.attemptMs))
       const result = await Promise.race([done.then(() => 'ok', (e) => e), deadline.then(() => 'timeout')])
       deadline.cancel()
-      if (result === 'timeout') {
-        attempt.abandoned = true
-        attempt.c?.close()
-        done.catch(() => {})
-      }
+      if (result === 'timeout') ctl.abort(Error('reconnect attempt timed out'))
       if (closing) return
       if (result === 'ok') break
       const e = result === 'timeout' ? Error('timed out after ' + clock.attemptMs + ' ms') : result
@@ -300,16 +322,38 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
     }
   }
 
-  await connect(true)
+  const shutdown = () => {
+    closing = true
+    for (const stop of [...waits]) stop()
+    conn?.close()
+    conn = null; out = null
+    attemptCtl?.abort(closedError())
+    try { channel?.close() } catch {}
+    channel = null
+  }
+  /** another page of this browser connected with this key: it owns the key now; stop for good */
+  const replaced = () => {
+    if (closing) return
+    stopped = Object.assign(Error('this key was opened in another tab of this browser; this one stopped'), { code: 'replaced' })
+    shutdown()
+    onerror(stopped)
+  }
+
+  try { await connect(true, new AbortController()) } catch (e) { shutdown(); throw e }
   joinedAt = Date.now()
 
   const g = {
     me,
     /** the current connection to the node (null while reconnecting) */
     get conn () { return conn },
-    /** false while the connection to the node is down and being made again, or for good once replaced */
+    /** false while the connection to the node is down and being made again */
     get connected () { return !!conn },
-    /** set (code 'replaced') once another session with this key took over: no more reconnecting */
+    /**
+     * true while the drops look like another tab or agent using this key (reported once to onerror with
+     * code 'contended'); the client keeps reconnecting, every 60 s then every 5 min, until a connection lasts
+     */
+    get contended () { return contended && !(conn && Date.now() - conn.at >= SHORT_MS) },
+    /** set (code 'replaced') once another page of this browser connected with this key; no more reconnecting */
     get stopped () { return stopped },
     topic,
     /** roster checkpoint id cited by new messages */
@@ -349,12 +393,7 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
       return [...got.values()].sort((a, b) => a.timestamp - b.timestamp).slice(-n)
     },
     /** close the connection for good: no reconnect, a reconnect in progress is cancelled, no timers left */
-    close () {
-      closing = true
-      for (const stop of [...waits]) stop()
-      conn?.close()
-      candidate?.close()
-    }
+    close () { shutdown() }
   }
   return g
 }

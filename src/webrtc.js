@@ -125,9 +125,12 @@ async function accept (st, handlers) {
 /**
  * Dial a libp2p WebRTC-direct multiaddr with Ed25519 identity `seed`/`pub`.
  * `handlers` maps protocol ids to fn(stream) for streams the server opens to us.
+ * `signal` (AbortSignal): aborting it closes the RTCPeerConnection at once, during the dial too, and the
+ * dial rejects; the dial owns its connection and timer from the start, so nothing outlives an abort.
  */
-export async function dial (addr, seed, pub, handlers, timeout = 20000) {
+export async function dial (addr, seed, pub, handlers, timeout = 20000, signal) {
   const a = parseAddr(addr)
+  if (signal?.aborted) throw signal.reason ?? Error('dial aborted')
   const pc = new RTCPeerConnection()
   let ended
   const conn = {
@@ -147,10 +150,17 @@ export async function dial (addr, seed, pub, handlers, timeout = 20000) {
     close () { pc.close(); ended() }
   }
   pc.onconnectionstatechange = () => /failed|closed|disconnected/.test(pc.connectionState) && ended()
-  let timer
+  let timer; let onAbort
   try {
-    return await Promise.race([connect(), new Promise((resolve, reject) => { timer = setTimeout(() => reject(Error('dial timeout')), timeout) })])
-  } catch (e) { pc.close(); throw e } finally { clearTimeout(timer) }
+    return await Promise.race([
+      connect(),
+      new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(Error('dial timeout')), timeout)
+        onAbort = () => reject(signal.reason ?? Error('dial aborted'))
+        signal?.addEventListener('abort', onAbort, { once: true })
+      })
+    ])
+  } catch (e) { conn.close(); throw e } finally { clearTimeout(timer); signal?.removeEventListener('abort', onAbort) }
 
   async function connect () {
     const hs = new Stream(pc.createDataChannel('', { negotiated: true, id: 0 }))
