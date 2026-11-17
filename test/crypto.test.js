@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import nc from 'node:crypto'
-import { x25519, edPublic, edSign, edVerify, seal, open, poly1305, chacha20, hmac, sha256 } from '../src/crypto.js'
+import * as C from '../src/crypto.js'
+const { xKeyPair, edPublic, edSign, edVerify, seal, open, poly1305, chacha20, hmac, sha256 } = C
 
 const h = (s) => Uint8Array.from(Buffer.from(s.replace(/\s/g, ''), 'hex'))
 const hx = (b) => Buffer.from(b).toString('hex')
@@ -51,25 +52,16 @@ test('ed25519 rejects non-canonical S and bad points', async () => {
   assert.ok(sk)
 })
 
-test('x25519 RFC 7748 vectors', () => {
-  assert.equal(hx(x25519(h('a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4'), h('e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c'))),
-    'c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552')
-  const a = h('77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a')
-  const b = h('5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb')
-  assert.equal(hx(x25519(a)), '8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a')
-  assert.equal(hx(x25519(b)), 'de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f')
-  const shared = '4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742'
-  assert.equal(hx(x25519(a, x25519(b))), shared)
-  assert.equal(hx(x25519(b, x25519(a))), shared)
-})
-
-test('x25519 matches node:crypto', () => {
+test('xKeyPair (native X25519) agrees with node:crypto and refuses low-order keys', async () => {
   for (let i = 0; i < 4; i++) {
-    const a = nc.generateKeyPairSync('x25519'); const b = nc.generateKeyPairSync('x25519')
-    const ska = a.privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(16)
+    const k = await xKeyPair(); const b = nc.generateKeyPairSync('x25519')
     const pkb = b.publicKey.export({ format: 'der', type: 'spki' }).subarray(12)
-    assert.equal(hx(x25519(ska, pkb)), hx(nc.diffieHellman({ privateKey: a.privateKey, publicKey: b.publicKey })))
+    const ours = nc.createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b656e032100', 'hex'), k.pub]), format: 'der', type: 'spki' })
+    assert.equal(hx(await k.dh(pkb)), hx(nc.diffieHellman({ privateKey: b.privateKey, publicKey: ours })))
   }
+  const k = await xKeyPair()
+  await assert.rejects(k.dh(new Uint8Array(32))) // u = 0: all-zero shared secret
+  await assert.rejects(k.dh(new Uint8Array(31)))
 })
 
 test('poly1305 RFC 8439 2.5.2', () => {
@@ -111,8 +103,7 @@ test('hmac / sha256 via WebCrypto', async () => {
     '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843')
 })
 
-// Secret-key operations go through WebCrypto (native, constant-time) when the browser has
-// Ed25519/X25519; the BigInt code is only a fallback.
+// Secret-key operations run only on native WebCrypto Ed25519/X25519.
 async function spying (fn) {
   const calls = []
   const s = crypto.subtle
@@ -122,8 +113,15 @@ async function spying (fn) {
   try { await fn() } finally { Object.assign(s, orig) }
   return calls
 }
+/** Run fn with subtle[method] rejecting `err` for algorithm alg. */
+async function withFailing (method, alg, err, fn) {
+  const s = crypto.subtle; const orig = s[method]
+  s[method] = function (...a) { if (a.some((x) => (x?.name || x) === alg)) return Promise.reject(err); return orig.apply(this, a) }
+  try { return await fn() } finally { s[method] = orig }
+}
+const unsupported = () => new DOMException('Unrecognized algorithm name', 'NotSupportedError')
 
-test('edSign uses WebCrypto Ed25519 when available', async () => {
+test('edSign uses WebCrypto Ed25519', async () => {
   const [sk, , msg, sig] = ED[1]
   let out
   const calls = await spying(async () => { out = await edSign(h(sk), h(msg)) })
@@ -131,15 +129,26 @@ test('edSign uses WebCrypto Ed25519 when available', async () => {
   assert.equal(hx(out), sig)
 })
 
-test('edSign / edPublic fall back to JS when WebCrypto lacks Ed25519', async () => {
-  const s = crypto.subtle; const orig = s.importKey
-  s.importKey = function (fmt, data, alg, ...a) { if ((alg.name || alg) === 'Ed25519') return Promise.reject(Error('NotSupportedError')); return orig.call(this, fmt, data, alg, ...a) }
-  try {
-    for (const [sk, pk, msg, sig] of ED) {
-      assert.equal(hx(await edPublic(h(sk))), pk)
-      assert.equal(hx(await edSign(h(sk), h(msg))), sig)
-    }
-  } finally { s.importKey = orig }
+test('secret-key ops refuse without native Ed25519 / X25519 (no JS fallback)', async () => {
+  const [sk, , msg] = ED[1]
+  const needs = (e) => e.message === C.NEEDS_NATIVE && /Chrome\/Edge 137\+, Firefox 130\+, Safari 17\+/.test(e.message)
+  await withFailing('importKey', 'Ed25519', unsupported(), async () => {
+    await assert.rejects(edSign(h(sk), h(msg)), needs)
+    await assert.rejects(edPublic(h(sk)), needs)
+  })
+  await withFailing('generateKey', 'X25519', unsupported(), () => assert.rejects(xKeyPair(), needs))
+})
+
+test('operational WebCrypto errors propagate unchanged', async () => {
+  const [sk, , msg] = ED[1]
+  const opErr = () => new DOMException('injected', 'OperationError')
+  const isOp = (e) => e.name === 'OperationError' && e.message === 'injected'
+  await withFailing('importKey', 'Ed25519', opErr(), () => assert.rejects(edSign(h(sk), h(msg)), isOp))
+  await withFailing('sign', 'Ed25519', opErr(), () => assert.rejects(edSign(h(sk), h(msg)), isOp))
+  await withFailing('generateKey', 'X25519', opErr(), () => assert.rejects(xKeyPair(), isOp))
+  const k = await xKeyPair()
+  const peer = nc.generateKeyPairSync('x25519').publicKey.export({ format: 'der', type: 'spki' }).subarray(12)
+  await withFailing('deriveBits', 'X25519', opErr(), () => assert.rejects(k.dh(peer), isOp))
 })
 
 test('noise handshake DH runs on WebCrypto X25519 when available', async () => {

@@ -22,6 +22,26 @@ const frame = (fields) => { const b = pb(fields); return cat(varint(b.length), b
 const fakeDC = () => ({ readyState: 'open', sent: [], send (d) { this.sent.push(new Uint8Array(d)) }, close () { this.readyState = 'closed'; this.onclose?.() } })
 const deliver = (dc, bytes) => { try { dc.onmessage({ data: Uint8Array.from(bytes).buffer }) } catch {} }
 
+test('a text data-channel message ends the stream before any allocation', async () => {
+  // binaryType only affects binary messages; new Uint8Array('1000') would be 1000 zero bytes
+  const dc = fakeDC(); const st = new Stream(dc)
+  const pending = st.read(1)
+  try { dc.onmessage({ data: '1000' }) } catch {}
+  assert.ok((await settled(pending)).e, 'reader rejected')
+  assert.equal(dc.readyState, 'closed')
+})
+
+test('a huge numeric text message does not allocate or stall', () => {
+  const out = child(`
+    import { Stream } from '${SRC}webrtc.js'
+    const dc = { readyState: 'open', send () {}, close () { this.readyState = 'closed'; this.onclose?.() } }
+    const st = new Stream(dc)
+    const t = performance.now()
+    try { dc.onmessage({ data: '2147483647' }) } catch {}
+    console.log(dc.readyState, performance.now() - t < 50)`)
+  assert.equal(out, 'closed true')
+})
+
 test('overlong frame-length varint does not hang the thread', () => {
   const out = child(`
     import { Stream } from '${SRC}webrtc.js'

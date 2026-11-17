@@ -49,6 +49,9 @@ export class Stream {
     this.opened.catch(() => {}) // awaited by whoever needs it; a channel nobody waits on may just close
     dc.onmessage = (e) => {
       if (dc.readyState === 'closed') return
+      // libp2p sends only binary frames; binaryType does not cover text messages, and
+      // new Uint8Array('2147483647') would allocate 2 GB, so anything else ends the stream
+      if (!(e.data instanceof ArrayBuffer)) return this.fail(Error('non-binary message'))
       try {
         let b = cat(this.raw, new Uint8Array(e.data)); let v
         while ((v = uvarint(b, 0, LIMIT)) && b.length >= v[0] + v[1]) {

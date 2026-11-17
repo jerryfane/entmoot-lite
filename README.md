@@ -7,7 +7,7 @@ ES module, small enough to go inside a Bitcoin inscription, and it runs inside o
 
 | file | raw | brotli |
 |---|---|---|
-| `dist/entmoot-lite.js` (the whole client) | 17.9 KB | **7.2 KB** |
+| `dist/entmoot-lite.js` (the whole client) | 17.3 KB | **7.0 KB** |
 
 The budget is 30 KB brotli. `npm run size` fails the build above it. For comparison, the js-libp2p probe this replaces
 was 132 KB brotli.
@@ -52,18 +52,19 @@ Only what Entmoot needs, in `src/`:
   - The Noise prologue is `libp2p-webrtc-noise:` ‖ our DTLS fingerprint multihash ‖ the server certhash.
   - libp2p streams map one-to-one onto data channels, framed as varint-prefixed protobuf `{flag, message}` with
     FIN/FIN_ACK/STOP_SENDING/RESET. No yamux is needed. The two halves of a stream close independently, and a peer's
-    RESET ends only our read half. Frames above the 16 KiB WebRTC message limit, overlong varints and malformed
-    protobuf end the stream with an error.
+    RESET ends only our read half. Text (non-binary) messages, frames above the 16 KiB WebRTC message limit,
+    overlong varints and malformed protobuf end the stream with an error before anything is allocated for them.
   - multistream-select 1.0.0, in both directions.
 - **`noise.js`**: `Noise_XX_25519_ChaChaPoly_SHA256`. The browser is the responder, as the WebRTC spec requires. It
   checks the libp2p static-key signature and that the remote key matches the `/p2p/` peer id. It refuses short
   handshake messages and low-order X25519 keys (an all-zero shared secret).
 - **`crypto.js`**:
-  - **Operations on secret keys:** Ed25519 signing and X25519 key agreement use the browser's native WebCrypto
-    Ed25519/X25519 when it has them (see Browser support).
-  - **Fallback when they are missing:** small BigInt implementations (RFC 8032, RFC 7748). They run a fixed number
-    of steps, but BigInt arithmetic is not constant-time. A page on an older browser therefore signs with a
-    timing-variable implementation.
+  - **Operations on secret keys:** Ed25519 signing and X25519 key generation/agreement run only on the browser's
+    native WebCrypto Ed25519/X25519. There is no JS fallback for secret keys.
+    - **Missing support:** if the browser lacks either algorithm (WebCrypto reports `NotSupportedError`), `join()`
+      fails with "entmoot-lite needs native WebCrypto Ed25519 and X25519 (Chrome/Edge 137+, Firefox 130+,
+      Safari 17+)".
+    - **Other WebCrypto errors** (e.g. `OperationError`) propagate unchanged.
   - **Ed25519 verify:** always the JS implementation, cofactorless and rejecting non-canonical S like Go, so that
     every browser accepts exactly what Go accepts. Verifying involves no secret.
   - **ChaCha20-Poly1305** (RFC 8439): in JS.
@@ -122,12 +123,14 @@ by non-members. It cannot forge a message under someone else's key.
 
 - **Tested:** Chromium 159 (Playwright headless), inside `<iframe sandbox="allow-scripts">` with ord's CSP and an
   opaque origin, using both WebRTC-direct v1 (munged ufrag) and v2 (`--force-fieldtrials=WebRTC-NoSdpMangleUfrag/Enabled/`).
-- **Requirements:** `RTCPeerConnection`, BigInt, ES2022, `String.prototype.toWellFormed` (Chrome 111, Firefox 119,
-  Safari 16.4), and WebCrypto `subtle` (SHA-256/512, HMAC). `subtle` needs a secure context. A sandboxed frame under
-  an https page such as ordinals.com qualifies, and so does http://localhost.
-- **Native secret-key crypto:** native WebCrypto Ed25519 (Chrome 137+, Firefox 129+, Safari 17+) and X25519
-  (Chrome 133+, Firefox 130+, Safari 17+) are used when present. Older browsers fall back to the JS code, which is
-  not constant-time.
+- **Requirements:**
+  - `RTCPeerConnection`, BigInt, ES2022, `String.prototype.toWellFormed`;
+  - WebCrypto `subtle` with SHA-256/512, HMAC, and native **Ed25519** and **X25519**.
+  - **Minimum versions** (stable, per MDN/caniuse): Ed25519 needs Chrome/Edge 137, Firefox 129, Safari 17;
+    X25519 needs Chrome/Edge 133, Firefox 130, Safari 17. Together: **Chrome/Edge 137+, Firefox 130+, Safari 17+**.
+    Older browsers are refused with the error above.
+  - **Secure context:** `subtle` needs one. A sandboxed frame under an https page such as ordinals.com qualifies,
+    and so does http://localhost.
 - **Untested:** Firefox and Safari. They should satisfy the API requirements [INFERENCE]. Whether each accepts a munged
   ufrag, or how it reports refusing one, has not been checked: the v2 fallback triggers on a
   `setLocalDescription` error.
@@ -168,8 +171,10 @@ ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> 
     verify over them, and member ids and peer ids must match the node's.
   - `test/golden-go.json` (written by `test/gen/golden-go.go` with entmoot's own Go code): a legacy v0 message,
     and a message whose topic held a lone surrogate.
-- **Native crypto path:** signing and Noise DH go through WebCrypto Ed25519/X25519 when available, with the JS
-  fallback checked against RFC vectors.
+- **Native-only secret keys:**
+  - signing and Noise DH go through WebCrypto Ed25519/X25519, checked against RFC vectors and `node:crypto`;
+  - without native support they refuse with the browser requirement, and `join()` fails with it;
+  - an injected `OperationError` propagates unchanged.
 - **Wire:**
   - protobuf bytes;
   - multiaddr parsing → inferred SDP;
@@ -178,6 +183,7 @@ ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> 
     prologues differ.
 - **Hostile peers** (`test/hostile.test.js`), where anything that could spin the thread runs in a child process
   with a deadline:
+  - text (non-binary) data-channel messages, including `"2147483647"`;
   - overlong and oversized frame varints;
   - malformed protobuf and frames;
   - RESET and close-without-FIN;

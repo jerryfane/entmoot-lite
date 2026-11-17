@@ -140,6 +140,15 @@ test('publish refuses topics Go would not accept', async () => {
   g.close()
 })
 
+test('join fails with the browser requirement when native Ed25519 is missing', async () => {
+  const node = setup()
+  const s = crypto.subtle; const orig = s.importKey
+  s.importKey = function (...a) { if (a.includes('Ed25519')) return Promise.reject(new DOMException('Unrecognized algorithm name', 'NotSupportedError')); return orig.apply(this, a) }
+  try {
+    await assert.rejects(join({ addr: node.addr, groupId: GROUP, key: edKey().seed, invite }), /needs native WebCrypto Ed25519 and X25519 \(Chrome\/Edge 137\+, Firefox 130\+, Safari 17\+\)/)
+  } finally { s.importKey = orig }
+})
+
 test('conn.stream closes the channel when the protocol is refused', async () => {
   const node = fakeNode()
   const me = edKey()

@@ -1,10 +1,13 @@
 // Minimal crypto for entmoot-lite. Hashes and HMAC come from WebCrypto (SHA-256/512 and
 // HMAC-SHA256 are available in every browser with WebRTC). Operations on secret keys (Ed25519
-// signing, X25519 key agreement) use WebCrypto's native Ed25519/X25519 when the browser has them
-// (Chrome/Edge 137+, Firefox 130+, Safari 17+); otherwise they fall back to the small BigInt code
-// below (RFC 7748, RFC 8032), which runs a fixed number of steps but, being BigInt, is NOT
-// constant-time. Ed25519 verification (public data) and ChaCha20-Poly1305 (RFC 8439) are JS.
+// signing, X25519 key generation and agreement) run only on the browser's native WebCrypto
+// Ed25519/X25519 (Chrome/Edge 137+, Firefox 130+, Safari 17+); without them they fail with
+// NEEDS_NATIVE. Ed25519 verification (public data only) and ChaCha20-Poly1305 (RFC 8439) are JS.
 import { cat, unb64 } from './util.js'
+
+export const NEEDS_NATIVE = 'entmoot-lite needs native WebCrypto Ed25519 and X25519 (Chrome/Edge 137+, Firefox 130+, Safari 17+)'
+/** Run a native WebCrypto call; an unsupported algorithm becomes NEEDS_NATIVE, other errors propagate. */
+const native = (p) => p.catch((e) => { throw e?.name === 'NotSupportedError' ? Error(NEEDS_NATIVE, { cause: e }) : e })
 
 const subtle = crypto.subtle
 export const random = (n) => crypto.getRandomValues(new Uint8Array(n))
@@ -22,44 +25,20 @@ const inv = (a) => pow(a, P - 2n)
 const le2n = (b) => { let n = 0n; for (let i = b.length; i--;) n = n << 8n | BigInt(b[i]); return n }
 const n2le = (n) => { const b = new Uint8Array(32); for (let i = 0; i < 32; i++, n >>= 8n) b[i] = Number(n & 255n); return b }
 
-// ---- X25519 (RFC 7748 Montgomery ladder, branch-free conditional swap) ---------------------
-export function x25519 (k, u = Uint8Array.of(9)) {
-  const s = le2n(k.slice(0, 32)) & ~7n & ~(1n << 255n) | 1n << 254n
-  const x1 = le2n(u.length < 32 ? cat(u, new Uint8Array(32 - u.length)) : u) & (1n << 255n) - 1n
-  let [x2, z2, x3, z3, sw] = [1n, 0n, x1, 1n, 0n]
-  const cswap = (m) => { m = -m & (1n << 256n) - 1n; let t = m & (x2 ^ x3); x2 ^= t; x3 ^= t; t = m & (z2 ^ z3); z2 ^= t; z3 ^= t }
-  for (let t = 254n; t >= 0n; t--) {
-    const b = s >> t & 1n
-    cswap(b ^ sw)
-    sw = b
-    const A = x2 + z2; const AA = A * A % P; const B = x2 - z2; const BB = B * B % P; const E = AA - BB
-    const C = x3 + z3; const D = x3 - z3; const DA = D * A % P; const CB = C * B % P
-    x3 = (DA + CB) ** 2n % P; z3 = mod(x1 * (DA - CB) ** 2n); x2 = mod(AA * BB); z2 = mod(E * (AA + 121665n * E))
-  }
-  cswap(sw)
-  return n2le(mod(x2 * inv(z2)))
-}
-
 /**
- * Ephemeral X25519 key pair {pub, dh(peerPub)}. dh rejects malformed and low-order peer keys
- * (an all-zero shared secret), as Noise requires.
+ * Ephemeral X25519 key pair {pub, dh(peerPub)} on native WebCrypto. dh rejects malformed and
+ * low-order peer keys (an all-zero shared secret), as Noise requires.
  */
 export async function xKeyPair () {
-  let pub; let dh
-  try {
-    const k = await subtle.generateKey('X25519', false, ['deriveBits'])
-    pub = new Uint8Array(await subtle.exportKey('raw', k.publicKey))
-    dh = async (p) => new Uint8Array(await subtle.deriveBits({ name: 'X25519', public: await subtle.importKey('raw', p, 'X25519', false, []) }, k.privateKey, 256))
-  } catch {
-    const sk = random(32)
-    pub = x25519(sk)
-    dh = async (p) => x25519(sk, p)
-  }
+  const k = await native(subtle.generateKey('X25519', false, ['deriveBits']))
   return {
-    pub,
+    pub: new Uint8Array(await native(subtle.exportKey('raw', k.publicKey))),
+    /** throws on a malformed or low-order key (native deriveBits may refuse it itself) */
     async dh (p) {
-      const r = p?.length === 32 && await dh(p)
-      if (!r || r.every((x) => !x)) throw Error('x25519: bad public key')
+      if (p?.length !== 32) throw Error('x25519: bad public key')
+      const pk = await native(subtle.importKey('raw', p, 'X25519', false, []))
+      const r = new Uint8Array(await native(subtle.deriveBits({ name: 'X25519', public: pk }, k.privateKey, 256)))
+      if (r.every((x) => !x)) throw Error('x25519: bad public key')
       return r
     }
   }
@@ -77,12 +56,8 @@ function add ([X1, Y1, Z1, T1], [X2, Y2, Z2, T2]) {
   const E = B - A; const F = Dd - C; const Gg = Dd + C; const H = B + A
   return [E * F % P, Gg * H % P, F * Gg % P, E * H % P]
 }
-/** n·pt; with steps, always runs that many add/double rounds and selects without skipping work */
-function mul (pt, n, steps = 0) {
-  let r = ZERO
-  for (let i = 0; n > 0n || i < steps; i++, n >>= 1n, pt = add(pt, pt)) { const s = add(r, pt); r = [r, s][Number(n & 1n)] }
-  return r
-}
+/** n·pt (variable time: only ever used on public values, for verification) */
+function mul (pt, n) { let r = ZERO; for (; n > 0n; n >>= 1n, pt = add(pt, pt)) if (n & 1n) r = add(r, pt); return r }
 function encode ([X, Y, Z]) { const zi = inv(Z); const x = mod(X * zi); const b = n2le(mod(Y * zi)); b[31] |= Number(x & 1n) << 7; return b }
 function decode (b) {
   const y = le2n(b) & (1n << 255n) - 1n
@@ -94,28 +69,13 @@ function decode (b) {
   return [x, y, 1n, x * y % P]
 }
 const hashN = async (...b) => mod(le2n(await sha512(...b)), N)
-async function expand (seed) {
-  const h = await sha512(seed)
-  const a = le2n(h.slice(0, 32)) & ~7n & ~(1n << 255n) | 1n << 254n
-  return { a, prefix: h.slice(32), pub: encode(mul(G, a, 256)) }
-}
-// A WebCrypto Ed25519 key for the seed (RFC 8410 PKCS#8 wrapping), or undefined if unsupported.
+// A native WebCrypto Ed25519 key for the seed (RFC 8410 PKCS#8 wrapping).
 const PKCS8 = Uint8Array.of(48, 46, 2, 1, 0, 48, 5, 6, 3, 43, 101, 112, 4, 34, 4, 32)
-const edKey = (seed) => subtle.importKey('pkcs8', cat(PKCS8, seed), 'Ed25519', true, ['sign']).catch(() => {})
+const edKey = (seed) => native(subtle.importKey('pkcs8', cat(PKCS8, seed), 'Ed25519', true, ['sign']))
 /** Ed25519 public key (32 bytes) of a 32-byte seed. */
-export async function edPublic (seed) {
-  const k = await edKey(seed)
-  return k ? unb64((await subtle.exportKey('jwk', k)).x) : (await expand(seed)).pub
-}
+export const edPublic = async (seed) => unb64((await native(subtle.exportKey('jwk', await edKey(seed)))).x)
 /** Ed25519 signature (64 bytes) of msg with a 32-byte seed. */
-export async function edSign (seed, msg) {
-  const k = await edKey(seed)
-  if (k) return new Uint8Array(await subtle.sign('Ed25519', k, msg))
-  const { a, prefix, pub } = await expand(seed)
-  const r = await hashN(prefix, msg)
-  const R = encode(mul(G, r, 256))
-  return cat(R, n2le(mod(r + await hashN(R, pub, msg) * a, N)))
-}
+export const edSign = async (seed, msg) => new Uint8Array(await native(subtle.sign('Ed25519', await edKey(seed), msg)))
 /** Ed25519 verify; false on any malformed input. */
 export async function edVerify (pub, msg, sig) {
   try {
