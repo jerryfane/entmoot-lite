@@ -59,13 +59,14 @@ function add ([X1, Y1, Z1, T1], [X2, Y2, Z2, T2]) {
 /** n·pt (variable time: only ever used on public values, for verification) */
 function mul (pt, n) { let r = ZERO; for (; n > 0n; n >>= 1n, pt = add(pt, pt)) if (n & 1n) r = add(r, pt); return r }
 function encode ([X, Y, Z]) { const zi = inv(Z); const x = mod(X * zi); const b = n2le(mod(Y * zi)); b[31] |= Number(x & 1n) << 7; return b }
+/** The point encoded in b, or undefined when b is not a valid encoding. */
 function decode (b) {
   const y = le2n(b) & (1n << 255n) - 1n
-  if (y >= P) throw Error('bad point')
+  if (y >= P) return
   const u = mod(y * y - 1n); const v = mod(D * y * y + 1n)
   let x = mod(u * pow(v, 3n) * pow(u * pow(v, 7n), (P - 5n) / 8n))
-  if (mod(v * x * x) !== u) { if (mod(v * x * x) !== mod(-u)) throw Error('bad point'); x = x * I % P }
-  if ((x & 1n) !== BigInt(b[31] >> 7)) { if (!x) throw Error('bad point'); x = P - x }
+  if (mod(v * x * x) !== u) { if (mod(v * x * x) !== mod(-u)) return; x = x * I % P }
+  if ((x & 1n) !== BigInt(b[31] >> 7)) { if (!x) return; x = P - x }
   return [x, y, 1n, x * y % P]
 }
 const hashN = async (...b) => mod(le2n(await sha512(...b)), N)
@@ -76,17 +77,19 @@ const edKey = (seed) => native(subtle.importKey('pkcs8', cat(PKCS8, seed), 'Ed25
 export const edPublic = async (seed) => unb64((await native(subtle.exportKey('jwk', await edKey(seed)))).x)
 /** Ed25519 signature (64 bytes) of msg with a 32-byte seed. */
 export const edSign = async (seed, msg) => new Uint8Array(await native(subtle.sign('Ed25519', await edKey(seed), msg)))
-/** Ed25519 verify; false on any malformed input. */
+/**
+ * Ed25519 verify; false for a malformed key or signature. Anything else that goes wrong is a
+ * bug, not a bad signature, so it propagates instead of reading as "unverified".
+ */
 export async function edVerify (pub, msg, sig) {
-  try {
-    if (sig.length !== 64 || pub.length !== 32) return false
-    const S = le2n(sig.slice(32))
-    if (S >= N) return false
-    const A = decode(pub); const R = sig.slice(0, 32)
-    const k = await hashN(R, pub, msg)
-    const chk = encode(add(mul(G, S), mul([P - A[0], A[1], A[2], P - A[3]], k)))
-    return chk.every((x, i) => x === R[i])
-  } catch { return false }
+  if (sig?.length !== 64 || pub?.length !== 32) return false
+  const S = le2n(sig.slice(32))
+  const A = S < N && decode(pub)
+  if (!A) return false
+  const R = sig.slice(0, 32)
+  const k = await hashN(R, pub, msg)
+  const chk = encode(add(mul(G, S), mul([P - A[0], A[1], A[2], P - A[3]], k)))
+  return chk.every((x, i) => x === R[i])
 }
 
 // ---- ChaCha20-Poly1305 (RFC 8439) -------------------------------------------------------------

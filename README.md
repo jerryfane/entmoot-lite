@@ -7,7 +7,7 @@ ES module, small enough to go inside a Bitcoin inscription, and it runs inside o
 
 | file | raw | brotli |
 |---|---|---|
-| `dist/entmoot-lite.js` (the whole client) | 17.3 KB | **7.0 KB** |
+| `dist/entmoot-lite.js` (the whole client) | 18.0 KB | **7.3 KB** |
 
 The budget is 30 KB brotli. `npm run size` fails the build above it. For comparison, the js-libp2p probe this replaces
 was 132 KB brotli.
@@ -21,7 +21,8 @@ const g = await join({
   addr: '/ip4/…/udp/…/webrtc-direct/certhash/u…/p2p/12D3KooW…', // node's address, e.g. invite.allowed_multiaddrs
   groupId: 'bLF0…=',                                          // base64 group id
   key,                                                         // 32-byte Ed25519 seed (Uint8Array or base64), never stored
-  invite                                                       // target-bound invite JSON for this key; omit if already a member
+  invite,                                                      // target-bound invite JSON for this key; omit if already a member
+  onerror                                                      // optional: errors in live processing (default console.error)
 })
 g.on('world/#', (msg) => console.log(msg.text, msg))   // live, verified; "+" / "#" topic wildcards
 await g.publish('world/chat', 'hello')                 // signs + gossips; resolves with the message id
@@ -35,6 +36,19 @@ g.close()
 - `g.rosterHead` is the checkpoint id that new messages cite.
 - `g.roster()` returns the raw `/entmoot/membership/1` reply.
 - `g.conn.version` is the WebRTC-direct ufrag scheme that was used (1 or 2).
+- `onerror(e)` receives errors that happen while live traffic is processed: a throwing `on()` handler, an RPC that
+  fails to decode, or a failure inside the client. Delivery continues afterwards. A message that fails its signature
+  check is not an error and is dropped quietly, but a check that cannot run (for example a broken WebCrypto) is
+  reported rather than read as "unverified".
+
+**Inlining it in a page** (an inscription is one file): put the module in `<script type=module>`, or import it from
+a `blob:` URL.
+- **Classic `<script>` also works:** if the page turns it into a classic `<script>` by dropping the final `export`,
+  the client's internals stay inside one function scope. Only `EL` (and `join`/`match`/`verify` if the `export`
+  line is kept as a declaration) becomes page-visible.
+- **Why this matters:** an earlier build put every minified internal at the top level. A page that set
+  `window.G = group` overwrote one of them, and every signature check then failed quietly, so no live messages or
+  history came through.
 
 The key and the invite are passed in, and the client never stores them. One Ed25519 key serves as the libp2p
 identity, the Entmoot author key and the member id, the same as in `entmootd`.
@@ -198,7 +212,12 @@ ENTMOOTD=/path/to/entmootd E2E_DIR=/tmp/el-e2e E2E_PUBLIC_IP=<your public IPv4> 
   - truncated and foreign history bodies;
   - expired snapshots;
   - topic validation;
-  - closing streams that fail negotiation.
+  - closing streams that fail negotiation;
+  - live delivery on the node-opened `/meshsub` stream, which continues after a throwing handler or an undecodable
+    RPC; a failure inside verification reaches `onerror`.
+- **The built module** (`test/dist.test.js`): `dist/entmoot-lite.js` inlined as a classic script.
+  - **Scope:** it adds no globals besides its API.
+  - **Name clashes:** verification still passes after the page overwrites every one- and two-letter global name.
 
 **End-to-end** (`e2e/run.mjs`):
 - **Node setup:**

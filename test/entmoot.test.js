@@ -81,6 +81,21 @@ test('topic patterns', () => {
   assert.ok(match('#', 'anything/here'))
 })
 
+test('verify: malformed messages are false, not exceptions', async () => {
+  const m = golden.messages[0]
+  for (const bad of [null, {}, { ...m, author: null }, { ...m, signature: '%%%' }, { ...m, author: { ...m.author, entmoot_pubkey: 'AAAA' } }, { ...m, version: 3 }, { ...m, signature: undefined }]) {
+    assert.equal(await verify(bad), false, JSON.stringify(bad)?.slice(0, 60))
+  }
+})
+
+test('verify: an internal failure throws instead of reading as "unverified"', async () => {
+  const s = crypto.subtle; const orig = s.digest
+  s.digest = function (alg, ...a) { return alg === 'SHA-512' ? Promise.reject(new DOMException('injected', 'OperationError')) : orig.call(this, alg, ...a) }
+  try {
+    await assert.rejects(verify(golden.messages[0]), (e) => e.name === 'OperationError')
+  } finally { s.digest = orig }
+})
+
 // test/golden-go.json: written by entmoot's own Go code (test/gen/golden-go.go).
 const goldenGo = JSON.parse(readFileSync(new URL('./golden-go.json', import.meta.url)))
 

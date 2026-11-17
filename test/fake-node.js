@@ -2,7 +2,7 @@
 // entmootd behind it (Noise initiator from node:crypto, multistream, Entmoot sync protocols).
 // It lets join()/dial() run unmodified in node:test.
 import nc from 'node:crypto'
-import { Stream } from '../src/webrtc.js'
+import { Stream, select } from '../src/webrtc.js'
 import { pb, unpb } from '../src/pb.js'
 import { b58, b64, b64url, cat, dec, enc } from '../src/util.js'
 
@@ -143,6 +143,16 @@ export function fakeNode () {
     async setLocalDescription (d) { this.localDescription = d }
     async setRemoteDescription (d) { this.remoteDescription = d }
     close () { node.closed = true; this.connectionState = 'closed' }
+
+    /** test helper: the node opens a stream to the client (like its /meshsub and identify streams) */
+    async openToClient (proto) {
+      const [a, b] = dcPair()
+      const st = new Stream(b)
+      this.ondatachannel({ channel: a })
+      await st.opened
+      await select(st, proto)
+      return st
+    }
   }
   return node
 }

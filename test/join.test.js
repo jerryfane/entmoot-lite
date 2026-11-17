@@ -5,7 +5,9 @@ import assert from 'node:assert/strict'
 import { join } from '../src/index.js'
 import { dial } from '../src/webrtc.js'
 import { sign } from '../src/entmoot.js'
-import { b64 } from '../src/util.js'
+import { b64, enc, lp } from '../src/util.js'
+import { pb } from '../src/pb.js'
+import { pubsubTopic } from '../src/entmoot.js'
 import { fakeNode, edKey, memberOf, tick } from './fake-node.js'
 
 const GROUP = b64(new Uint8Array(32).fill(5))
@@ -128,6 +130,48 @@ test('history: restarts listing after snapshot_expired', async () => {
   }
   const g = await join({ addr: node.addr, groupId: GROUP, key: me.seed })
   assert.deepEqual((await g.history('#', 50)).map((m) => m.text), ['m0'])
+  g.close()
+})
+
+/** a gossipsub RPC publishing message m on the group's topic, framed as the node sends it */
+const gossip = async (m) => lp(pb([[2, pb([[2, enc(JSON.stringify(m))], [4, await pubsubTopic(GROUP)]])]]))
+const until = async (fn) => { for (let i = 0; i < 200 && !fn(); i++) await new Promise((resolve) => setTimeout(resolve, 5)) }
+
+test('live: node-published messages arrive; a throwing handler or a bad RPC does not stop delivery', async () => {
+  const me = edKey()
+  const node = setup({ members: [memberOf(me.pub)] })
+  const errors = []
+  const g = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: (e) => errors.push(e) })
+  const got = []
+  g.on('t/#', (m) => { got.push(m.text); if (m.text === 'm1') throw Error('handler bug') })
+  const st = await node.pc.openToClient('/meshsub/1.1.0')
+  st.write(await gossip(await msg(1)))
+  await until(() => errors.length)
+  st.write(lp(Uint8Array.of(0x0a, 5, 1))) // an RPC that fails to decode
+  await until(() => errors.length > 1)
+  st.write(await gossip(await msg(2)))
+  await until(() => got.length > 1)
+  assert.deepEqual(got, ['m1', 'm2'])
+  assert.deepEqual(errors.map((e) => e.message), ['handler bug', 'pb truncated'])
+  g.close()
+})
+
+test('live: a failure inside verification is reported, not dropped as an unverified message', async () => {
+  const me = edKey()
+  const node = setup({ members: [memberOf(me.pub)] })
+  const errors = []
+  const g = await join({ addr: node.addr, groupId: GROUP, key: me.seed, onerror: (e) => errors.push(e) })
+  g.on('#', () => {})
+  const st = await node.pc.openToClient('/meshsub/1.1.0')
+  const m = await msg(3)
+  const s = crypto.subtle; const orig = s.digest
+  // the message id hash is fine; the hash inside signature verification fails (SHA-512)
+  s.digest = function (alg, ...a) { return alg === 'SHA-512' ? Promise.reject(new DOMException('injected', 'OperationError')) : orig.call(this, alg, ...a) }
+  try {
+    st.write(await gossip(m))
+    await until(() => errors.length)
+  } finally { s.digest = orig }
+  assert.equal(errors[0]?.name, 'OperationError')
   g.close()
 })
 
