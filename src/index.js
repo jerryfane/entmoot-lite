@@ -40,6 +40,11 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
   }
   const onRpc = async (b) => {
     const r = unpb(b)
+    // The node announces its subscriptions each time it (re)adds us as a gossipsub peer. That also happens
+    // when an older connection with our peer id (the same key on a page that went away) finally dies:
+    // the node then drops the subscription we sent on this connection, so send it again. Changes to the
+    // node's other topics (other groups) don't trigger it.
+    if (out && (r[1] || []).some((s) => { const u = unpb(s); return u[1]?.[0] && dec(u[2]?.[0] || []) === topic })) subscribe()
     for (const raw of r[2] || []) { const m = unpb(raw); if (dec(m[4]?.[0] || []) === topic && m[2]) await emit(m[2][0]) }
     // answer gossip (IHAVE) with IWANT for messages not seen yet
     const want = []
@@ -47,6 +52,7 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
     if (want.length) send([[3, pb([[2, pb([[1, want]])]])]])
   }
   const send = (fields) => out?.write(lp(pb(fields)))
+  const subscribe = () => send([[1, pb([[1, true], [2, topic]])], [3, pb([[3, pb([[1, topic]])]])]])
 
   const conn = await dial(addr, seed, pub, {
     // identify: tell the node we speak gossipsub, or it never adds us as a pubsub peer
@@ -100,7 +106,7 @@ export async function join ({ addr, groupId, key, invite, timeout, onerror = (e)
 
     // GossipSub: subscribe only now that we are on the roster (the node drops non-member SUBSCRIBEs)
     out = await conn.stream(MESHSUB)
-    send([[1, pb([[1, true], [2, topic]])], [3, pb([[3, pb([[1, topic]])]])]])
+    subscribe()
 
     /** message ids of the group's stored history, oldest first (whole list; see README limits) */
     const listIds = async () => {

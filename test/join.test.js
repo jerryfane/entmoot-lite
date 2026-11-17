@@ -5,8 +5,8 @@ import assert from 'node:assert/strict'
 import { join } from '../src/index.js'
 import { dial } from '../src/webrtc.js'
 import { sign } from '../src/entmoot.js'
-import { b64, enc, lp } from '../src/util.js'
-import { pb } from '../src/pb.js'
+import { b64, dec, enc, lp } from '../src/util.js'
+import { pb, unpb } from '../src/pb.js'
 import { pubsubTopic } from '../src/entmoot.js'
 import { fakeNode, edKey, memberOf, tick } from './fake-node.js'
 
@@ -201,4 +201,44 @@ test('conn.stream closes the channel when the protocol is refused', async () => 
   await tick()
   assert.equal(node.channels.at(-1).client.readyState, 'closed')
   conn.close()
+})
+
+/** A member joined against a node that records every gossipsub RPC the client sends, decoded. */
+async function liveClient () {
+  const me = edKey()
+  const node = setup({ members: [memberOf(me.pub)] })
+  const sent = []
+  node.raw['/meshsub/1.1.0'] = async (s) => { for (;;) sent.push(unpb(await s.lp())) }
+  const g = await join({ addr: node.addr, groupId: GROUP, key: me.seed })
+  await until(() => sent.length)
+  return { g, node, sent, topic: await pubsubTopic(GROUP), toClient: await node.pc.openToClient('/meshsub/1.1.0') }
+}
+const subscription = (topic, on = true) => pb([[1, on], [2, topic]])
+/** the topics a client RPC subscribes to and GRAFTs */
+const subsAndGrafts = (rpc) => ({
+  subscribe: (rpc[1] || []).map((s) => unpb(s)).filter((s) => s[1]?.[0]).map((s) => dec(s[2][0])),
+  graft: (rpc[3] || []).flatMap((c) => (unpb(c)[3] || []).map((x) => dec(unpb(x)[1][0])))
+})
+
+test('live: the node re-announcing our topic gets SUBSCRIBE and GRAFT again', async () => {
+  // A page that went away without closing leaves the node an older connection with our peer id. When that
+  // one dies, the node drops the subscription we sent on this connection and announces its own again.
+  const { g, sent, topic, toClient } = await liveClient()
+  assert.deepEqual(sent.map(subsAndGrafts), [{ subscribe: [topic], graft: [topic] }])
+  toClient.write(lp(pb([[1, [subscription('/entmoot/group/2/other'), subscription(topic)]]])))
+  await until(() => sent.length > 1)
+  assert.deepEqual(sent.map(subsAndGrafts), [{ subscribe: [topic], graft: [topic] }, { subscribe: [topic], graft: [topic] }])
+  g.close()
+})
+
+test('live: no re-subscribe on messages or gossip or other topics or unsubscribes', async () => {
+  const { g, sent, topic, toClient } = await liveClient()
+  toClient.write(await gossip(await msg(4)))
+  toClient.write(lp(pb([[1, [subscription('/entmoot/group/2/other'), subscription(topic, false)]]])))
+  toClient.write(lp(pb([[3, pb([[1, pb([[1, topic], [2, new Uint8Array(32).fill(9)]])]])]]))) // IHAVE → one IWANT
+  await until(() => sent.length > 1)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(sent.filter((r) => subsAndGrafts(r).subscribe.length || subsAndGrafts(r).graft.length).length, 1)
+  assert.equal(sent.length, 2, 'the initial SUBSCRIBE+GRAFT and the IWANT')
+  g.close()
 })
